@@ -2,6 +2,7 @@ use hikvision_rs::api::{Channel, HikvisionAPI};
 use hikvision_rs::rtsp;
 use eframe::egui;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashSet;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
@@ -141,7 +142,18 @@ impl HikvisionApp {
                     format!("{} | {} | {}", info.name, info.model, info.firmware);
                 match api.channels() {
                     Ok(chs) => {
-                        self.channels = chs;
+                        let mut seen = std::collections::HashSet::new();
+                        let mut deduped = Vec::new();
+                        for ch in chs {
+                            let ch_num = ch.id.parse::<u32>().unwrap_or(0) / 100;
+                            if ch_num > 0 && seen.insert(ch_num) {
+                                deduped.push(ch);
+                                if deduped.len() >= 16 {
+                                    break;
+                                }
+                            }
+                        }
+                        self.channels = deduped;
                         self.streams = (0..self.channels.len())
                             .map(|_| StreamState::new())
                             .collect();
