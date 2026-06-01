@@ -3,14 +3,48 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::encrypted_stream::{decrypt_rtp_payload, derive_verification_code_key};
+use crate::netstream::NetStream;
 use crate::playctrl::{self, PlayCtrl};
 use crate::rtsp::RtspFrame;
 
+use ffmpeg_next::codec::{self as codec_mod, Context as CodecContext, Id as CodecId};
+use ffmpeg_next::packet::Packet;
+use ffmpeg_next::software::scaling::Context as SwsContext;
+use ffmpeg_next::format::Pixel;
+use ffmpeg_next::frame::Video as VideoFrame;
+
+static PLAYCTRL: OnceLock<PlayCtrl> = OnceLock::new();
+
+fn get_cached_playctrl(library_path: Option<&str>) -> Result<&'static PlayCtrl> {
+    if let Some(pc) = PLAYCTRL.get() {
+        return Ok(pc);
+    }
+    log::info!("Loading libPlayCtrl.so (cached once)");
+    let pc = if let Some(path) = library_path {
+        PlayCtrl::load_from(std::path::Path::new(path))?
+    } else {
+        playctrl::search_and_load()?
+    };
+    // Race-safe: if another thread already set it, ours is dropped (harmless)
+    let _ = PLAYCTRL.set(pc);
+    Ok(PLAYCTRL.get().unwrap())
+}
+
 struct RtspSession {
     stream: TcpStream,
+}
+
+/// Store the most recent Digest challenge fields so we can pre-emptively
+/// include an Authorization header without first getting a 401.
+struct DigestState {
+    realm: String,
+    nonce: String,
+    opaque: String,
+    qop: String,
 }
 
 impl RtspSession {
@@ -27,81 +61,184 @@ impl RtspSession {
 
         let channels_uri = format!("rtsp://{}:{}/Streaming/Channels/{}", host, port, channel);
         let mut cseq = 0u32;
+        let mut digest: Option<DigestState> = None;
 
-        {
-            let cseq_local = {
-                cseq += 1;
-                cseq
-            };
-            let describe = format!(
-                "DESCRIBE {} RTSP/1.0\r\n\
+        // Helper closure: send request, optionally with pre-computed auth.
+        // On 401, compute fresh auth and retry.
+        let mut send_request = |method: &str, uri: &str, extra_headers: &str| -> Result<String> {
+            cseq += 1;
+
+            // Build an Authorization header from cached challenge, if we have one
+            let auth_header = digest.as_ref().map(|d| {
+                let ha1 = format!("{:x}", md5::compute(format!("{}:{}:{}", user, d.realm, password).as_bytes()));
+                let ha2 = format!("{:x}", md5::compute(format!("{}:{}", method, uri).as_bytes()));
+                let (response, suffix) = if !d.qop.is_empty() {
+                    let cnonce = format!("{:x}", md5::compute(format!("{}{}", d.nonce, user).as_bytes()));
+                    let resp = format!(
+                        "{:x}",
+                        md5::compute(format!("{}:{}:00000001:{}:auth:{}", ha1, d.nonce, cnonce, ha2).as_bytes())
+                    );
+                    (resp, format!(", nc=00000001, cnonce=\"{}\", qop=auth", cnonce))
+                } else {
+                    let resp = format!(
+                        "{:x}",
+                        md5::compute(format!("{}:{}:{}", ha1, d.nonce, ha2).as_bytes())
+                    );
+                    (resp, String::new())
+                };
+                let mut h = format!(
+                    "Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", response=\"{}\"{}",
+                    user, d.realm, d.nonce, uri, response, suffix,
+                );
+                if !d.opaque.is_empty() {
+                    h.push_str(&format!(", opaque=\"{}\"", d.opaque));
+                }
+                h
+            });
+
+            let auth_line = auth_header
+                .map(|a| format!("Authorization: {}\r\n", a))
+                .unwrap_or_default();
+
+            let req = format!(
+                "{} {} RTSP/1.0\r\n\
                  CSeq: {}\r\n\
+                 {}\
+                 {}\
                  User-Agent: hikvision-rs\r\n\
-                 Accept: application/sdp\r\n\
                  \r\n",
-                channels_uri, cseq_local
+                method, uri, cseq, auth_line, extra_headers,
             );
-            stream.write_all(describe.as_bytes())?;
+            log::warn!(">>> {} CSeq:{}", method, cseq);
+            stream.write_all(req.as_bytes())?;
             let resp = Self::read_response(&mut stream)?;
+            let status = resp.lines().next().unwrap_or("?").to_string();
+            log::warn!("<<< {} ({} bytes)", status, resp.len());
 
-            if resp.contains("401 Unauthorized") {
+            let parse_challenge = |resp: &str| -> Option<DigestState> {
                 let challenge = resp
                     .lines()
                     .find(|l| l.to_lowercase().contains("www-authenticate"))
                     .and_then(|l| l.splitn(2, ':').nth(1))
-                    .map(|s| s.trim())
-                    .unwrap_or("");
+                    .map(|s| s.trim())?;
 
-                let digest = compute_rtsp_digest(challenge, "DESCRIBE", &channels_uri, user, password)?;
+                let body = challenge
+                    .strip_prefix("Digest ")
+                    .or_else(|| challenge.strip_prefix("digest "))
+                    .unwrap_or(challenge);
+
+                let mut realm = String::new();
+                let mut nonce = String::new();
+                let mut opaque = String::new();
+                let mut qop = String::new();
+                for part in body.split(',') {
+                    let part = part.trim();
+                    if let Some(eq) = part.find('=') {
+                        let key = part[..eq].trim();
+                        let val = part[eq + 1..].trim().trim_matches('"');
+                        match key.to_lowercase().as_str() {
+                            "realm" => realm = val.to_string(),
+                            "nonce" => nonce = val.to_string(),
+                            "opaque" => opaque = val.to_string(),
+                            "qop" => qop = val.to_string(),
+                            _ => {}
+                        }
+                    }
+                }
+                if realm.is_empty() || nonce.is_empty() {
+                    None
+                } else {
+                    Some(DigestState { realm, nonce, opaque, qop })
+                }
+            };
+
+            if resp.contains("401 Unauthorized") {
+                let challenge = parse_challenge(&resp)
+                    .ok_or_else(|| anyhow::anyhow!("401 without valid WWW-Authenticate"))?;
+
+                log::warn!("WWW-Authenticate: realm={} nonce={}...", challenge.realm, &challenge.nonce[..challenge.nonce.len().min(8)]);
+                let ha1 = format!("{:x}", md5::compute(format!("{}:{}:{}", user, challenge.realm, password).as_bytes()));
+                let ha2 = format!("{:x}", md5::compute(format!("{}:{}", method, uri).as_bytes()));
+                let (response, suffix) = if !challenge.qop.is_empty() {
+                    let cnonce = format!("{:x}", md5::compute(format!("{}{}", challenge.nonce, user).as_bytes()));
+                    let resp = format!(
+                        "{:x}",
+                        md5::compute(format!("{}:{}:00000001:{}:auth:{}", ha1, challenge.nonce, cnonce, ha2).as_bytes())
+                    );
+                    (resp, format!(", nc=00000001, cnonce=\"{}\", qop=auth", cnonce))
+                } else {
+                    let resp = format!(
+                        "{:x}",
+                        md5::compute(format!("{}:{}:{}", ha1, challenge.nonce, ha2).as_bytes())
+                    );
+                    (resp, String::new())
+                };
+                let mut digest_str = format!(
+                    "Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", response=\"{}\"{}",
+                    user, challenge.realm, challenge.nonce, uri, response, suffix,
+                );
+                if !challenge.opaque.is_empty() {
+                    digest_str.push_str(&format!(", opaque=\"{}\"", challenge.opaque));
+                }
+                log::warn!("Authorization: {}", digest_str);
+
+                // Cache the challenge for future requests
+                digest = Some(DigestState {
+                    realm: challenge.realm.clone(),
+                    nonce: challenge.nonce.clone(),
+                    opaque: challenge.opaque.clone(),
+                    qop: challenge.qop.clone(),
+                });
 
                 cseq += 1;
-                let describe2 = format!(
-                    "DESCRIBE {} RTSP/1.0\r\n\
+                let req2 = format!(
+                    "{} {} RTSP/1.0\r\n\
                      CSeq: {}\r\n\
                      Authorization: {}\r\n\
+                     {}\
                      User-Agent: hikvision-rs\r\n\
-                     Accept: application/sdp\r\n\
                      \r\n",
-                    channels_uri, cseq, digest
+                    method, uri, cseq, digest_str, extra_headers,
                 );
-                stream.write_all(describe2.as_bytes())?;
+                log::warn!(">>> {} CSeq:{} (with auth)", method, cseq);
+                stream.write_all(req2.as_bytes())?;
                 let resp2 = Self::read_response(&mut stream)?;
-                if !resp2.contains("200 OK") {
-                    anyhow::bail!("DESCRIBE failed: {}", &resp2[..resp2.len().min(200)]);
-                }
-            } else if !resp.contains("200 OK") {
-                anyhow::bail!("DESCRIBE failed: {}", &resp[..resp.len().min(200)]);
+                let status2 = resp2.lines().next().unwrap_or("?").to_string();
+                log::warn!("<<< {} ({} bytes)", status2, resp2.len());
+                Ok(resp2)
+            } else {
+                Ok(resp)
             }
-        }
+        };
 
-        let track_uri = format!("{}/trackID=1", channels_uri);
-        cseq += 1;
-        let setup = format!(
-            "SETUP {} RTSP/1.0\r\n\
-             CSeq: {}\r\n\
-             Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\
-             User-Agent: hikvision-rs\r\n\
-             \r\n",
-            track_uri, cseq
-        );
-        stream.write_all(setup.as_bytes())?;
-        let setup_resp = Self::read_response(&mut stream)?;
+        // DESCRIBE
+        let resp = send_request("DESCRIBE", &channels_uri, "Accept: application/sdp\r\n")?;
+        if !resp.contains("200 OK") {
+            anyhow::bail!("DESCRIBE failed: {}", &resp[..resp.len().min(200)]);
+        }
+        log::warn!("SDP response:\n{}", &resp[..resp.len().min(2048)]);
+
+        // Extract track control from SDP
+        let track_id = resp.lines()
+            .find(|l| l.trim().starts_with("a=control:trackID="))
+            .and_then(|l| l.split('=').nth(2))
+            .unwrap_or("1");
+        log::warn!("Using trackID={}", track_id);
+
+        // SETUP with correct trackID from SDP
+        let track_uri = format!("{}/trackID={}", channels_uri, track_id);
+        let setup_resp = send_request("SETUP", &track_uri,
+            "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n")?;
         if !setup_resp.contains("200 OK") {
             anyhow::bail!("SETUP failed: {}", &setup_resp[..setup_resp.len().min(200)]);
         }
+        log::warn!("SETUP response:\n{}", &setup_resp[..setup_resp.len().min(1024)]);
 
-        cseq += 1;
+        // PLAY — use the same track_uri (not channels_uri), required for non-standard trackIDs like "video"
         let session = Self::extract_session(&setup_resp);
-        let play = format!(
-            "PLAY {} RTSP/1.0\r\n\
-             CSeq: {}\r\n\
-             Session: {}\r\n\
-             User-Agent: hikvision-rs\r\n\
-             \r\n",
-            channels_uri, cseq, session
-        );
-        stream.write_all(play.as_bytes())?;
-        let play_resp = Self::read_response(&mut stream)?;
+        log::warn!("Extracted session: '{}'", session);
+        let play_extra = format!("Session: {}\r\nRange: npt=now-\r\n", session);
+        let play_resp = send_request("PLAY", &track_uri, &play_extra)?;
         if !play_resp.contains("200 OK") {
             anyhow::bail!("PLAY failed: {}", &play_resp[..play_resp.len().min(200)]);
         }
@@ -199,59 +336,6 @@ impl RtspSession {
     }
 }
 
-fn compute_rtsp_digest(
-    challenge: &str,
-    method: &str,
-    uri: &str,
-    user: &str,
-    password: &str,
-) -> Result<String> {
-    let body = challenge
-        .strip_prefix("Digest ")
-        .or_else(|| challenge.strip_prefix("digest "))
-        .unwrap_or(challenge);
-
-    let mut realm = "";
-    let mut nonce = "";
-    let mut opaque = "";
-    for part in body.split(',') {
-        let part = part.trim();
-        if let Some(eq) = part.find('=') {
-            let key = part[..eq].trim();
-            let val = part[eq + 1..].trim().trim_matches('"');
-            match key.to_lowercase().as_str() {
-                "realm" => realm = val,
-                "nonce" => nonce = val,
-                "opaque" => opaque = val,
-                _ => {}
-            }
-        }
-    }
-
-    if realm.is_empty() || nonce.is_empty() {
-        anyhow::bail!("incomplete Digest challenge");
-    }
-
-    let ha1 = format!("{:x}", md5::compute(format!("{}:{}:{}", user, realm, password).as_bytes()));
-    let ha2 = format!("{:x}", md5::compute(format!("{}:{}", method, uri).as_bytes()));
-    let cnonce = format!("{:x}", md5::compute(format!("{}{}", nonce, user).as_bytes()));
-    let response = format!(
-        "{:x}",
-        md5::compute(
-            format!("{}:{}:00000001:{}:auth:{}", ha1, nonce, cnonce, ha2).as_bytes()
-        )
-    );
-
-    let mut auth = format!(
-        "Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", response=\"{}\", nc=00000001, cnonce=\"{}\", qop=auth",
-        user, realm, nonce, uri, response, cnonce,
-    );
-    if !opaque.is_empty() {
-        auth.push_str(&format!(", opaque=\"{}\"", opaque));
-    }
-    Ok(auth)
-}
-
 fn strip_rtp_header(data: &[u8]) -> &[u8] {
     if data.len() < 12 {
         return data;
@@ -282,13 +366,21 @@ pub fn stream_loop(
     stop: Arc<AtomicBool>,
     repaint: egui::Context,
 ) {
+    let playctrl = match get_cached_playctrl(library_path) {
+        Ok(p) => p,
+        Err(e) => {
+            log::error!("Failed to load PlayCtrl: {}", e);
+            return;
+        }
+    };
+
     loop {
         if stop.load(Ordering::Relaxed) {
             return;
         }
         match run_stream(
-            host, rtsp_port, channel, user, password, verification_code,
-            library_path, &tx, &stop, &repaint,
+            playctrl, host, rtsp_port, channel, user, password, verification_code,
+            &tx, &stop, &repaint,
         ) {
             Ok(()) => return,
             Err(e) => {
@@ -305,39 +397,70 @@ pub fn stream_loop(
 }
 
 fn run_stream(
+    playctrl: &PlayCtrl,
     host: &str,
     rtsp_port: u16,
     channel: &str,
     user: &str,
     password: &str,
     verification_code: &str,
-    library_path: Option<&str>,
     tx: &SyncSender<RtspFrame>,
     stop: &Arc<AtomicBool>,
     repaint: &egui::Context,
 ) -> Result<()> {
-    log::info!(
+    log::warn!(
         "PlayCtrl stream: {}:{} ch={}",
         host, rtsp_port, channel
     );
 
-    let playctrl = if let Some(path) = library_path {
-        PlayCtrl::load_from(std::path::Path::new(path))?
-    } else {
-        playctrl::search_and_load()?
-    };
-    log::info!("libPlayCtrl.so loaded");
-
     let port = playctrl.get_port()?;
-    log::info!("Allocated decoder port {}", port);
+    log::warn!("Allocated decoder port {}", port);
+
+    // Derive AES key from verification code for manual decryption fallback
+    let aes_key = if !verification_code.is_empty() {
+        let key = derive_verification_code_key(verification_code);
+        log::info!("Derived AES-256 key from verification code (SHA256): {:02x?}...", &key[..4]);
+        Some(key)
+    } else {
+        None
+    };
 
     if !verification_code.is_empty() {
-        playctrl.set_secret_key(port, verification_code)?;
-        log::info!("Secret key set ({} chars)", verification_code.len());
+        log::warn!("Setting PlayM4_SetSecretKey (verification code '{}') on port {} (before OpenStream)", verification_code, port);
+        match playctrl.set_secret_key(port, verification_code) {
+            Ok(()) => log::info!("PlayM4_SetSecretKey OK"),
+            Err(e) => log::warn!("PlayM4_SetSecretKey failed: {} (error {})", e, playctrl.get_last_error()),
+        }
     }
 
     playctrl.open_stream(port, 2 * 1024 * 1024)?;
     log::info!("Stream opened (2 MB buffer)");
+
+    // Try to load NetStream for decryption fallback
+    let netstream = (|| -> Option<NetStream> {
+        match NetStream::load() {
+            Ok(ns) => {
+                log::info!("NetStream loaded successfully");
+                match ns.set_secret_key(0, verification_code) {
+                    Ok(()) => {
+                        log::info!("NetStream key set successfully (key_idx=0)");
+                        Some(ns)
+                    }
+                    Err(e) => {
+                        log::warn!("NetStream key set failed: {}", e);
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("NetStream load failed: {}", e);
+                None
+            }
+        }
+    })();
+    if netstream.is_none() && !verification_code.is_empty() {
+        log::warn!("No decryption available (PlayCtrl failed, NetStream unavailable)");
+    }
 
     let mut rtsp = RtspSession::connect(host, rtsp_port, channel, user, password)?;
     log::info!("RTSP session active");
@@ -351,20 +474,47 @@ fn run_stream(
     while !stop.load(Ordering::Relaxed) {
         match rtsp.read_rtp_frame() {
             Ok(Some((_ch, rtp_data))) => {
-                let payload = strip_rtp_header(&rtp_data);
-                if !payload.is_empty() {
-                    frame_count += 1;
-                    byte_count += payload.len() as u64;
-                    if let Err(e) = playctrl.input_data(port, payload) {
-                        let err_code = playctrl.get_last_error();
-                        if err_code == 29 {
-                            log::warn!(
-                                "PLAYM4_SECRET_KEY_ERROR (29): verification code '{}' may be incorrect",
-                                verification_code
-                            );
-                        } else if frame_count % 100 == 0 {
-                            log::debug!("InputData warning: {} (error {})", e, err_code);
+                if rtp_data.len() <= 12 { continue; }
+
+                // Manual AES decryption of RTP payload before feeding to PlayCtrl
+                let data_to_feed = if let Some(ref key) = aes_key {
+                    let payload = &rtp_data[12..];
+                    let decrypted = decrypt_rtp_payload(payload, key);
+                    if decrypted != payload {
+                        if frame_count < 3 {
+                            log::warn!("Decrypted RTP payload ({} bytes -> {} bytes)", payload.len(), decrypted.len());
+                            if !decrypted.is_empty() {
+                                log::warn!("First 16 decrypted bytes: {:02x?}", &decrypted[..decrypted.len().min(16)]);
+                            }
                         }
+                        // Rebuild RTP packet with decrypted payload
+                        let mut modified = Vec::with_capacity(12 + decrypted.len());
+                        modified.extend_from_slice(&rtp_data[..12]);
+                        modified.extend_from_slice(&decrypted);
+                        modified
+                    } else {
+                        if frame_count < 3 {
+                            log::warn!("Decryption returned same payload ({} bytes) - no change", payload.len());
+                        }
+                        rtp_data.to_vec()
+                    }
+                } else {
+                    rtp_data.to_vec()
+                };
+
+                frame_count += 1;
+                byte_count += data_to_feed.len() as u64;
+                if let Err(e) = playctrl.input_data(port, &data_to_feed) {
+                    let err_code = playctrl.get_last_error();
+                    if frame_count < 5 {
+                        log::warn!("InputData error {}: {} (error {}: {})", frame_count, e, err_code,
+                            crate::playctrl::last_error_name(err_code));
+                    }
+                    if err_code == 29 {
+                        log::warn!(
+                            "PLAYM4_SECRET_KEY_ERROR (29): verification code '{}' may be incorrect",
+                            verification_code
+                        );
                     }
                 }
 
@@ -427,6 +577,393 @@ fn run_stream(
     log::info!(
         "Session ended. {} frames fed, {:.1} seconds",
         frame_count, elapsed
+    );
+    Ok(())
+}
+
+/// FFmpeg-based decoder for channel zero with manual AES decryption.
+///
+/// Bypasses PlayCtrl entirely (which can't handle channel 001's multiplexed stream).
+/// Derives AES key from verification code, decrypts RTP payloads, then feeds
+/// the raw H.264 NAL units to FFmpeg's decoder.
+///
+/// # Channel Zero Notes
+///
+/// O Canal Zero (Channel Zero) é um recurso de NVRs/DVRs Hikvision que permite
+/// visualizar múltiplas câmeras em um único stream multiplexado (formato grid).
+///
+/// - **ID do canal**: Geralmente "0", "1" ou "001" dependendo do modelo
+/// - **Stream**: Apenas stream principal (dwStreamType=0), sub-stream não disponível
+/// - **Erro 953**: Indica que o dispositivo não suporta Canal Zero ou não está ativado
+///
+/// Para ativar: Acesse a interface web do DVR > Configurações > Visualização > Canal Zero
+pub fn zero_channel_stream_loop(
+    host: &str,
+    rtsp_port: u16,
+    channel: &str,
+    user: &str,
+    password: &str,
+    verification_code: &str,
+    tx: SyncSender<RtspFrame>,
+    stop: Arc<AtomicBool>,
+    repaint: egui::Context,
+) {
+    log::info!("Zero channel stream loop started for channel {}", channel);
+
+    if verification_code.trim().is_empty() {
+        log::error!("Zero channel requer Verification Code para descriptografia");
+        let _ = tx.try_send(RtspFrame {
+            width: 640,
+            height: 480,
+            rgba: vec![0u8; 640 * 480 * 4], // Black frame
+        });
+        return;
+    }
+
+    // Tentar múltiplos IDs de canal se o primeiro falhar
+    let channel_ids_to_try: Vec<&str> = if channel == "001" || channel == "0" || channel == "1" {
+        vec!["001", "0", "1"] // Ordem de preferência
+    } else {
+        vec![channel]
+    };
+
+    for channel_id in channel_ids_to_try {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+
+        log::info!("Tentando Canal Zero com ID: {}", channel_id);
+
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            match run_zero_channel(
+                host, rtsp_port, channel_id, user, password, verification_code,
+                &tx, &stop, &repaint,
+            ) {
+                Ok(()) => {
+                    log::info!("Zero channel session ended normally");
+                    return;
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+
+                    // Erro 953 = NET_ERR_NO_ZERO_CHAN (canal zero não disponível)
+                    if err_str.contains("404") || err_str.contains("401") || err_str.contains("refused") {
+                        log::warn!("Canal Zero ID {} não disponível: {}", channel_id, e);
+                        break; // Tentar próximo ID
+                    }
+
+                    log::error!("Zero channel stream error: {}, reconnecting in 2s...", e);
+                    for _ in 0..20 {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }
+        }
+    }
+
+    log::error!("Todos os IDs de Canal Zero falharam");
+}
+
+fn run_zero_channel(
+    host: &str,
+    rtsp_port: u16,
+    channel: &str,
+    user: &str,
+    password: &str,
+    verification_code: &str,
+    tx: &SyncSender<RtspFrame>,
+    stop: &Arc<AtomicBool>,
+    repaint: &egui::Context,
+) -> Result<()> {
+    log::warn!("Zero channel (FFmpeg+decrypt): {}:{} ch={}", host, rtsp_port, channel);
+
+    // Derive AES key from verification code (SHA256)
+    let aes_key = if !verification_code.is_empty() {
+        let key = derive_verification_code_key(verification_code);
+        log::info!("Zero ch: derived AES-256 key from verification code (SHA256): {:02x?}...", &key[..8]);
+        Some(key)
+    } else {
+        log::warn!("Zero ch: no verification code provided, decryption disabled");
+        None
+    };
+
+    if verification_code.is_empty() {
+        log::error!("Zero ch: Verification code é obrigatório para Canal Zero criptografado");
+        anyhow::bail!("Verification code é obrigatório para Canal Zero");
+    }
+
+    // Connect RTSP
+    log::info!("Conectando RTSP para Canal Zero: {}:{}/Streaming/Channels/{}", host, rtsp_port, channel);
+    let mut rtsp = RtspSession::connect(host, rtsp_port, channel, user, password)?;
+    log::info!("Zero ch: RTSP session active");
+
+    // Create FFmpeg H.264 decoder
+    let h264_codec = codec_mod::decoder::find(CodecId::H264)
+        .ok_or_else(|| anyhow::anyhow!("H.264 decoder not found"))?;
+    let codec_ctx = CodecContext::new_with_codec(h264_codec);
+    let mut decoder = codec_ctx.decoder().video()?;
+    unsafe {
+        (*decoder.as_mut_ptr()).thread_count = 2;
+    }
+
+    let mut scaler: Option<SwsContext> = None;
+    let mut decoded_frame = VideoFrame::empty();
+    let mut rgba_frame = VideoFrame::empty();
+
+    let mut frame_count = 0u64;
+    let mut byte_count = 0u64;
+    let start = Instant::now();
+    let mut pts: i64 = 0;
+
+    // Buffer for accumulating NAL units into Annex B format
+    let mut nal_buf = Vec::with_capacity(65536);
+
+    while !stop.load(Ordering::Relaxed) {
+        match rtsp.read_rtp_frame() {
+            Ok(Some((_ch, rtp_data))) => {
+                if rtp_data.len() <= 12 { continue; }
+                let payload = &rtp_data[12..];
+
+                // Decrypt RTP payload if we have a key
+                let decrypted = if let Some(ref key) = aes_key {
+                    let d = decrypt_rtp_payload(payload, key);
+                    if d != payload && frame_count < 2 {
+                        log::warn!("Zero ch: decrypted {} -> {} bytes", payload.len(), d.len());
+                        if !d.is_empty() {
+                            let first = d[0];
+                            let nal_type = first & 0x1F;
+                            log::warn!("Zero ch: first decrypted byte = 0x{:02x} (NAL type {})", first, nal_type);
+                        }
+                    }
+                    d
+                } else {
+                    payload.to_vec()
+                };
+
+                if decrypted.is_empty() { continue; }
+
+                // Log dos primeiros frames para debug
+                if frame_count < 3 {
+                    log::info!("Zero ch: Frame {} - {} bytes, NAL type: {}, keyframe: {}",
+                        frame_count,
+                        decrypted.len(),
+                        decrypted[0] & 0x1F,
+                        (decrypted[0] & 0x1F) == 5
+                    );
+                }
+
+                // Log dos primeiros frames para debug
+                if frame_count < 3 {
+                    log::info!("Zero ch: Frame {} - {} bytes, NAL type: {}, keyframe: {}",
+                        frame_count,
+                        decrypted.len(),
+                        decrypted[0] & 0x1F,
+                        (decrypted[0] & 0x1F) == 5
+                    );
+                }
+
+                // Parse RTP payload format and extract NAL units
+                // Single NAL unit: [NAL header | NAL body]
+                // FU-A: [FU indicator | FU header | NAL body fragments]
+                // STAP-A: [STAP header | NALU1 size | NALU1 | ...]
+                let nal_type = decrypted[0] & 0x1F;
+
+                match nal_type {
+                    1..=23 => {
+                        // Single NAL unit packet
+                        nal_buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+                        nal_buf.extend_from_slice(&decrypted);
+                    }
+                    24 => {
+                        // STAP-A: aggregation packet
+                        let mut off = 1; // Skip STAP-A NAL header
+                        while off + 2 < decrypted.len() {
+                            let nalu_size = u16::from_be_bytes([decrypted[off], decrypted[off + 1]]) as usize;
+                            off += 2;
+                            if off + nalu_size > decrypted.len() { break; }
+                            nal_buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+                            nal_buf.extend_from_slice(&decrypted[off..off + nalu_size]);
+                            off += nalu_size;
+                        }
+                    }
+                    28 => {
+                        // FU-A: fragmentation unit
+                        if decrypted.len() < 2 { continue; }
+                        let fu_header = decrypted[1];
+                        let start_bit = (fu_header >> 7) & 0x01;
+                        let end_bit = (fu_header >> 6) & 0x01;
+                        // Reconstruct NAL header: keep forbidden+ref_idc from FU indicator, NAL type from FU header
+                        let nal_header = (decrypted[0] & 0xE0) | (fu_header & 0x1F);
+                        if start_bit != 0 {
+                            // Start of fragmented NAL unit
+                            if !nal_buf.is_empty() {
+                                // Flush previous incomplete NAL unit
+                                log::warn!("Zero ch: flushing {} bytes (incomplete NAL)", nal_buf.len());
+                            }
+                            nal_buf.clear();
+                            nal_buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+                            nal_buf.push(nal_header);
+                        }
+                        if decrypted.len() > 2 {
+                            nal_buf.extend_from_slice(&decrypted[2..]);
+                        }
+                        if end_bit != 0 {
+                            // Complete NAL unit ready - flush below via pts increment
+                        }
+                    }
+                    _ => {
+                        log::debug!("Zero ch: unknown NAL type {} (0x{:02x})", nal_type, decrypted[0]);
+                    }
+                }
+
+                frame_count += 1;
+                byte_count += rtp_data.len() as u64;
+
+                // FU-A end bit completou o NAL unit
+                if nal_type == 28 && decrypted.len() >= 2 {
+                    let fu_header = decrypted[1];
+                    let end_bit = (fu_header >> 6) & 0x01;
+                    if end_bit != 0 {
+                        log::trace!("Zero ch: FU-A end bit detected, flushing {} bytes", nal_buf.len());
+                    }
+                }
+
+                // FU-A end bit completou o NAL unit
+                if nal_type == 28 && decrypted.len() >= 2 {
+                    let fu_header = decrypted[1];
+                    let end_bit = (fu_header >> 6) & 0x01;
+                    if end_bit != 0 {
+                        log::trace!("Zero ch: FU-A end bit detected, flushing {} bytes", nal_buf.len());
+                    }
+                }
+
+                // When we have accumulated data and see a FU-A end bit, or periodically,
+                // flush the buffer to the decoder
+                if nal_buf.len() > 1024 || (frame_count % 30 == 0 && nal_buf.len() > 100) {
+                    let mut packet = Packet::new(nal_buf.len());
+                    if let Some(data) = packet.data_mut() {
+                        data.copy_from_slice(&nal_buf);
+                    }
+                    packet.set_pts(Some(pts));
+                    packet.set_stream(0);
+
+                    match decoder.send_packet(&packet) {
+                        Ok(()) => {
+                            loop {
+                                match decoder.receive_frame(&mut decoded_frame) {
+                                    Ok(()) => {
+                                        // Create scaler lazily on first frame
+                                        let sws = match scaler.as_mut() {
+                                            Some(s) => s,
+                                            None => {
+                                                scaler = Some(
+                                                    SwsContext::get(
+                                                        decoded_frame.format(),
+                                                        decoded_frame.width(),
+                                                        decoded_frame.height(),
+                                                        Pixel::RGBA,
+                                                        decoded_frame.width(),
+                                                        decoded_frame.height(),
+                                                        ffmpeg_next::software::scaling::Flags::BILINEAR,
+                                                    )
+                                                    .context("Zero ch: failed to create scaler")?,
+                                                );
+                                                scaler.as_mut().unwrap()
+                                            }
+                                        };
+
+                                        match sws.run(&decoded_frame, &mut rgba_frame) {
+                                            Ok(()) => {
+                                                let w = rgba_frame.width();
+                                                let h = rgba_frame.height();
+                                                let stride = rgba_frame.stride(0);
+                                                let data = rgba_frame.data(0);
+                                                let row_bytes = w as usize * 4;
+
+                                                let rgba = if stride == row_bytes {
+                                                    data[..row_bytes * h as usize].to_vec()
+                                                } else {
+                                                    let mut buf = Vec::with_capacity(row_bytes * h as usize);
+                                                    for row in 0..h as usize {
+                                                        let start = row * stride;
+                                                        buf.extend_from_slice(&data[start..start + row_bytes]);
+                                                    }
+                                                    buf
+                                                };
+
+                                                let rtsp_frame = RtspFrame {
+                                                    width: w,
+                                                    height: h,
+                                                    rgba,
+                                                };
+                                                let _ = tx.try_send(rtsp_frame);
+                                                repaint.request_repaint();
+
+                                                let elapsed = start.elapsed().as_secs_f64();
+                                                if elapsed > 0.0 && frame_count % 50 == 0 {
+                                                    log::info!(
+                                                        "Zero ch: {:.1} fps, {:.2} MB, {}x{}",
+                                                        frame_count as f64 / elapsed,
+                                                        byte_count as f64 / 1_000_000.0,
+                                                        w, h,
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                if frame_count % 100 == 0 {
+                                                    log::warn!("Zero ch: scaler error: {}", e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(ffmpeg_next::Error::Eof | ffmpeg_next::Error::InvalidData) => break,
+                                    Err(e) => {
+                                        if frame_count % 50 == 0 {
+                                            log::debug!("Zero ch: receive_frame error: {}", e);
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if frame_count < 5 {
+                                log::warn!("Zero ch: send_packet error: {}", e);
+                            }
+                        }
+                    }
+
+                    pts += 1;
+                    nal_buf.clear();
+                }
+            }
+            Ok(None) => {
+                log::info!("Zero ch: RTSP stream ended");
+                break;
+            }
+            Err(e) => {
+                log::error!("Zero ch: RTSP read error: {}", e);
+                break;
+            }
+        }
+    }
+
+    let elapsed = start.elapsed().as_secs_f64();
+    let fps = if elapsed > 0.0 { frame_count as f64 / elapsed } else { 0.0 };
+    log::info!(
+        "Zero ch: session ended. {} frames, {:.1} seconds, {:.1} FPS",
+        frame_count, elapsed, fps
+    );
+    log::info!(
+        "Zero ch: total received: {:.2} MB, decoder frames: {}",
+        byte_count as f64 / 1_000_000.0,
+        frame_count
     );
     Ok(())
 }

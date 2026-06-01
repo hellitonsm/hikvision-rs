@@ -75,6 +75,9 @@ pub struct DeviceInfo {
     pub firmware: String,
     /// Nome do dispositivo configurado pelo usuário.
     pub name: String,
+    /// Número de canais zero disponíveis (0 = não suporta Canal Zero).
+    /// O Canal Zero permite visualizar múltiplas câmeras em um único stream multiplexado.
+    pub zero_chan_num: u8,
 }
 
 /// Cliente HTTP para a API ISAPI da Hikvision com autenticação Digest.
@@ -202,16 +205,18 @@ impl HikvisionAPI {
             if status == 401 {
                 anyhow::bail!("Digest auth failed (still 401 after retry)");
             }
-            let code = status.as_u16();
-            if code >= 400 {
-                anyhow::bail!("HTTP {}", code);
-            }
-            return Ok(resp);
+        let code = status.as_u16();
+        if code >= 400 {
+            log::warn!("request_inner {} {} -> HTTP {}", method, path, code);
+            anyhow::bail!("HTTP {} for {}", code, path);
         }
+        return Ok(resp);
+    }
 
         let code = status.as_u16();
         if code >= 400 {
-            anyhow::bail!("HTTP {}", code);
+            log::warn!("request_inner {} {} -> HTTP {}", method, path, code);
+            anyhow::bail!("HTTP {} for {}", code, path);
         }
         Ok(resp)
     }
@@ -417,7 +422,7 @@ fn strip_ns(xml: &str) -> String {
 
 /// Parseia o XML de `/ISAPI/System/deviceInfo` em um [`DeviceInfo`].
 ///
-/// Extrai os campos `model`, `serialNumber`, `firmwareVersion` e `deviceName`.
+/// Extrai os campos `model`, `serialNumber`, `firmwareVersion`, `deviceName` e `zeroChanNum`.
 fn parse_device_info(xml: &str) -> Result<DeviceInfo> {
     let xml = strip_ns(xml);
     let mut reader = Reader::from_str(&xml);
@@ -427,6 +432,7 @@ fn parse_device_info(xml: &str) -> Result<DeviceInfo> {
         serial: String::new(),
         firmware: String::new(),
         name: String::new(),
+        zero_chan_num: 0,
     };
     loop {
         match reader.read_event_into(&mut buf) {
@@ -439,6 +445,7 @@ fn parse_device_info(xml: &str) -> Result<DeviceInfo> {
                     "serialNumber" => info.serial = text,
                     "firmwareVersion" => info.firmware = text,
                     "deviceName" => info.name = text,
+                    "zeroChanNum" => info.zero_chan_num = text.parse().unwrap_or(0),
                     _ => {}
                 }
             }

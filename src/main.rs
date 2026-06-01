@@ -74,6 +74,7 @@ struct Config {
     use_snapshot: bool,
     snapshot_interval: u64,
     use_playctrl: bool,
+    use_zero_channel: bool,
 }
 
 impl Default for Config {
@@ -90,6 +91,7 @@ impl Default for Config {
             use_snapshot: true,
             snapshot_interval: 300,
             use_playctrl: false,
+            use_zero_channel: false,
         }
     }
 }
@@ -144,6 +146,7 @@ impl Config {
         app.use_snapshot = self.use_snapshot;
         app.snapshot_interval = self.snapshot_interval;
         app.use_playctrl = self.use_playctrl;
+        app.use_zero_channel = self.use_zero_channel;
     }
 
     fn from_app(app: &HikvisionApp) -> Self {
@@ -159,6 +162,7 @@ impl Config {
             use_snapshot: app.use_snapshot,
             snapshot_interval: app.snapshot_interval,
             use_playctrl: app.use_playctrl,
+            use_zero_channel: app.use_zero_channel,
         }
     }
 }
@@ -203,10 +207,12 @@ struct HikvisionApp {
     use_snapshot: bool,
     snapshot_interval: u64,
     use_playctrl: bool,
+    use_zero_channel: bool,
 
     api: Option<HikvisionAPI>,
     channels: Vec<Channel>,
     device_name: String,
+    device_supports_zero_channel: bool,
     error: Option<String>,
 
     layout_mode: LayoutMode,
@@ -229,9 +235,11 @@ impl Default for HikvisionApp {
             use_snapshot: true,
             snapshot_interval: 300,
             use_playctrl: false,
+            use_zero_channel: false,
             api: None,
             channels: Vec::new(),
             device_name: String::new(),
+            device_supports_zero_channel: false,
             error: None,
             layout_mode: LayoutMode::Single,
             prev_layout: LayoutMode::Single,
@@ -269,17 +277,37 @@ impl HikvisionApp {
             Ok(info) => {
                 self.device_name =
                     format!("{} | {} | {}", info.name, info.model, info.firmware);
+                self.device_supports_zero_channel = info.zero_chan_num > 0;
+
+                if self.use_zero_channel && !self.device_supports_zero_channel {
+                    log::warn!("Canal Zero solicitado mas dispositivo não suporta (zeroChanNum={})", info.zero_chan_num);
+                    self.error = Some("Dispositivo não suporta Canal Zero. Desative a opção ou ative no DVR.".into());
+                    return;
+                }
+
+                if self.device_supports_zero_channel {
+                    log::info!("Dispositivo suporta Canal Zero (zeroChanNum={})", info.zero_chan_num);
+                }
+
                 match api.channels() {
                     Ok(chs) => {
                         let mut seen = std::collections::HashSet::new();
                         let mut deduped = Vec::new();
                         for ch in chs {
                             let ch_num = ch.id.parse::<u32>().unwrap_or(0) / 100;
-                            if ch_num > 0 && seen.insert(ch_num) {
+                            if seen.insert(ch_num) {
                                 deduped.push(ch);
-                                if deduped.len() >= 16 {
+                                if deduped.len() >= 17 {
                                     break;
                                 }
+                            }
+                        }
+                        if self.use_zero_channel {
+                            if !deduped.iter().any(|c| c.id == "001") {
+                                deduped.insert(0, Channel {
+                                    id: "001".to_string(),
+                                    name: "Canal Zero".to_string(),
+                                });
                             }
                         }
                         self.channels = deduped;
@@ -304,7 +332,14 @@ impl HikvisionApp {
     }
 
     fn rtsp_url(&self, channel_id: &str, force_substream: bool) -> String {
-        let cid = if self.use_substream || force_substream {
+        let cid = if channel_id == "1" || channel_id == "0" || channel_id == "001" {
+            // Canal Zero: tentar múltiplos IDs dependendo do modelo do NVR
+            // Alguns modelos usam "0", outros "001", outros "1"
+            if self.device_supports_zero_channel {
+                log::info!("Canal Zero detectado: usando ID '{}' para RTSP", channel_id);
+            }
+            channel_id.to_string()
+        } else if self.use_substream || force_substream {
             if channel_id.ends_with('1') {
                 let mut s = channel_id[..channel_id.len() - 1].to_string();
                 s.push('2');
@@ -367,10 +402,11 @@ impl HikvisionApp {
 
         let channel_id = self.channels[channel_index].id.clone();
         let channel_name = self.channels[channel_index].name.clone();
+        let is_zero_ch = channel_id == "001" || channel_id == "1" || channel_id == "0";
         let force_sub = matches!(
             self.layout_mode,
             LayoutMode::Grid2x2 | LayoutMode::Grid3x3 | LayoutMode::Grid4x4
-        );
+        ) && !is_zero_ch;
 
         let host = self.host.trim().to_string();
         let port: u16 = self.port.trim().parse().unwrap_or(80);
@@ -395,7 +431,25 @@ impl HikvisionApp {
         state.fps_timer = Instant::now();
         state.fps = 0.0;
 
-        if use_snapshot {
+        if is_zero_ch {
+            // Canal zero: RTP payload has visible NAL headers but encrypted NAL body.
+            // Uses custom RTSP client + manual AES decryption + FFmpeg H.264 decoder.
+            // Bypasses PlayCtrl (which can't handle canal 001's multiplexed format).
+            log::info!("Starting zero-channel stream (FFmpeg+decrypt) for {}: {}", channel_id, channel_name);
+            if verification_code.trim().is_empty() {
+                log::error!("Canal Zero requer Verification Code para descriptografia");
+                return;
+            }
+            let cid = channel_id.clone();
+            let handle = thread::spawn(move || {
+                playctrl_stream::zero_channel_stream_loop(
+                    &host, rtsp_port, &cid, &user, &password,
+                    &verification_code,
+                    tx, stop, repaint_ctx,
+                );
+            });
+            state.stream_handle = Some(handle);
+        } else if use_snapshot {
             log::info!("Starting snapshot stream for channel {}: {}", channel_id, channel_name);
             let cid = channel_id.clone();
             let handle = thread::spawn(move || {
@@ -527,7 +581,15 @@ impl HikvisionApp {
                         ui.label("");
                         ui.checkbox(&mut self.use_playctrl, "Usar PlayCtrl (descriptografia)");
                         ui.end_row();
-                        if self.use_playctrl {
+                        ui.label("");
+                        ui.checkbox(&mut self.use_zero_channel, "Canal Zero (stream multiplexado)");
+                        ui.end_row();
+                        if self.use_zero_channel {
+                            ui.label("");
+                            ui.label(egui::RichText::new("⚠️ Requer NVR/DVR com Canal Zero ativado nas configurações").small().color(egui::Color32::DARK_GRAY));
+                            ui.end_row();
+                        }
+                        if self.use_playctrl || self.use_zero_channel {
                             ui.label("Verification Code:");
                             ui.add_sized([field_w, field_h], egui::TextEdit::singleline(&mut self.verification_code).password(true));
                             ui.end_row();
@@ -572,6 +634,9 @@ impl HikvisionApp {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(&self.device_name);
+                if self.device_supports_zero_channel {
+                    ui.label(egui::RichText::new("🔀 Canal Zero OK").small().color(egui::Color32::GREEN));
+                }
                 if self.streams.iter().any(|s| s.stream_handle.is_some()) {
                     ui.separator();
                     let active = self.streams.iter().filter(|s| s.stream_handle.is_some()).count();
@@ -585,6 +650,7 @@ impl HikvisionApp {
                         self.channels.clear();
                         self.streams.clear();
                         self.focused_channel = None;
+                        self.device_supports_zero_channel = false;
                     }
                 });
             });
