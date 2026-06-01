@@ -5,3 +5,5 @@ pub mod encrypted_stream;
 pub mod playctrl;
 pub mod playctrl_stream;
 pub mod netstream;
+pub mod hcnetsdk;
+pub mod hcnetsdk_stream;

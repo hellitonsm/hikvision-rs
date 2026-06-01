@@ -21,12 +21,55 @@ Visualizador RTSP para DVRs Hikvision com interface gráfica nativa (egui/eframe
 
 - [FFmpeg](https://ffmpeg.org/) (libavformat, libavcodec, libavutil, libswscale)
 - Rust 2021 edition
+- **Para descriptografia**: bibliotecas do SDK Hikvision (libPlayCtrl.so)
 
 ### Instalação do FFmpeg (Debian/Ubuntu)
 
 ```bash
 sudo apt install libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
 ```
+
+### Bibliotecas do SDK Hikvision (para streams criptografados)
+
+Para usar os modos **PlayCtrl** ou **Canal Zero** com criptografia ativada, você precisa da biblioteca proprietária `libPlayCtrl.so` do SDK Hikvision.
+
+#### Onde obter
+
+1. **Device Network SDK** (recomendado): Baixe o [SDK para Linux 64-bit](https://www.hikvision.com/en/support/download/sdk/) no site oficial da Hikvision
+2. **LocalComponent**: Se você já usa o plugin web Hikvision, a biblioteca pode estar em:
+   ```
+   ~/.local/share/hikvision/weblocalserver/files/bin/libPlayCtrl.so
+   ```
+
+#### Instalação
+
+Copie `libPlayCtrl.so` (e suas dependências Qt5) para um dos caminhos de busca:
+
+```bash
+# Opção 1: Diretório do projeto
+mkdir -p hikvision-libs
+cp libPlayCtrl.so hikvision-libs/
+
+# Opção 2: Diretório de configuração do usuário
+mkdir -p ~/.config/hikvision-rs
+cp libPlayCtrl.so ~/.config/hikvision-rs/
+
+# Opção 3: Sistema
+sudo cp libPlayCtrl.so /usr/local/lib/
+sudo ldconfig
+```
+
+#### Verificação
+
+O aplicativo busca automaticamente a biblioteca nos seguintes locais (em ordem):
+
+1. `./hikvision-libs/libPlayCtrl.so`
+2. `~/.config/hikvision-rs/libPlayCtrl.so`
+3. `~/.local/share/hikvision/weblocalserver/files/bin/libPlayCtrl.so`
+4. `/usr/local/lib/libPlayCtrl.so`
+5. `/usr/lib/libPlayCtrl.so`
+
+Se não encontrar, você verá o erro: `libPlayCtrl.so not found in any search path.`
 
 ## Compilação
 

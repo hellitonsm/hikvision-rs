@@ -2,6 +2,7 @@ use hikvision_rs::api::{Channel, HikvisionAPI};
 use hikvision_rs::playctrl_stream;
 use hikvision_rs::rtsp;
 use hikvision_rs::snapshot_stream;
+use hikvision_rs::hcnetsdk_stream;
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -75,6 +76,7 @@ struct Config {
     snapshot_interval: u64,
     use_playctrl: bool,
     use_zero_channel: bool,
+    use_hcnetsdk: bool,
 }
 
 impl Default for Config {
@@ -92,6 +94,7 @@ impl Default for Config {
             snapshot_interval: 300,
             use_playctrl: false,
             use_zero_channel: false,
+            use_hcnetsdk: false,
         }
     }
 }
@@ -147,6 +150,7 @@ impl Config {
         app.snapshot_interval = self.snapshot_interval;
         app.use_playctrl = self.use_playctrl;
         app.use_zero_channel = self.use_zero_channel;
+        app.use_hcnetsdk = self.use_hcnetsdk;
     }
 
     fn from_app(app: &HikvisionApp) -> Self {
@@ -163,6 +167,7 @@ impl Config {
             snapshot_interval: app.snapshot_interval,
             use_playctrl: app.use_playctrl,
             use_zero_channel: app.use_zero_channel,
+            use_hcnetsdk: app.use_hcnetsdk,
         }
     }
 }
@@ -208,6 +213,7 @@ struct HikvisionApp {
     snapshot_interval: u64,
     use_playctrl: bool,
     use_zero_channel: bool,
+    use_hcnetsdk: bool,
 
     api: Option<HikvisionAPI>,
     channels: Vec<Channel>,
@@ -236,6 +242,7 @@ impl Default for HikvisionApp {
             snapshot_interval: 300,
             use_playctrl: false,
             use_zero_channel: false,
+            use_hcnetsdk: false,
             api: None,
             channels: Vec::new(),
             device_name: String::new(),
@@ -416,6 +423,7 @@ impl HikvisionApp {
         let interval = self.snapshot_interval;
         let use_snapshot = self.use_snapshot;
         let use_playctrl = self.use_playctrl;
+        let use_hcnetsdk = self.use_hcnetsdk;
         let verification_code = self.verification_code.clone();
         let library_path = self.library_path.clone();
         let url = self.rtsp_url(&channel_id, force_sub);
@@ -455,6 +463,40 @@ impl HikvisionApp {
             let handle = thread::spawn(move || {
                 snapshot_stream::snapshot_stream_loop(
                     &cid, &host, port, &user, &password, tx, stop, repaint_ctx, interval,
+                );
+            });
+            state.stream_handle = Some(handle);
+        } else if use_hcnetsdk {
+            log::info!("Starting HCNetSDK stream for channel {}: {}", channel_id, channel_name);
+            let cid = channel_id.clone();
+            let vc = verification_code.clone();
+            let lp = if library_path.is_empty() {
+                None
+            } else {
+                Some(library_path)
+            };
+            let handle = thread::spawn(move || {
+                hcnetsdk_stream::hcnetsdk_stream_loop(
+                    &host, port, &user, &password, &cid,
+                    &vc, lp.as_deref(),
+                    tx, stop, repaint_ctx,
+                );
+            });
+            state.stream_handle = Some(handle);
+        } else if use_hcnetsdk {
+            log::info!("Starting HCNetSDK stream for channel {}: {}", channel_id, channel_name);
+            let cid = channel_id.clone();
+            let vc = verification_code.clone();
+            let lp = if library_path.is_empty() {
+                None
+            } else {
+                Some(library_path)
+            };
+            let handle = thread::spawn(move || {
+                hcnetsdk_stream::hcnetsdk_stream_loop(
+                    &host, port, &user, &password, &cid,
+                    &vc, lp.as_deref(),
+                    tx, stop, repaint_ctx,
                 );
             });
             state.stream_handle = Some(handle);
@@ -584,18 +626,32 @@ impl HikvisionApp {
                         ui.label("");
                         ui.checkbox(&mut self.use_zero_channel, "Canal Zero (stream multiplexado)");
                         ui.end_row();
+                        ui.label("");
+                        ui.checkbox(&mut self.use_hcnetsdk, "HCNetSDK (SDK oficial, descriptografia automática)");
+                        ui.end_row();
+                        if self.use_hcnetsdk {
+                            ui.label("");
+                            ui.label(egui::RichText::new("ℹ️ Usa libhcnetsdk.so para descriptografia nativa").small().color(egui::Color32::DARK_GRAY));
+                            ui.end_row();
+                        }
                         if self.use_zero_channel {
                             ui.label("");
                             ui.label(egui::RichText::new("⚠️ Requer NVR/DVR com Canal Zero ativado nas configurações").small().color(egui::Color32::DARK_GRAY));
                             ui.end_row();
                         }
-                        if self.use_playctrl || self.use_zero_channel {
+                        if self.use_playctrl || self.use_zero_channel || self.use_hcnetsdk {
                             ui.label("Verification Code:");
                             ui.add_sized([field_w, field_h], egui::TextEdit::singleline(&mut self.verification_code).password(true));
                             ui.end_row();
-                            ui.label("Library Path:");
-                            ui.add_sized([field_w, field_h], egui::TextEdit::singleline(&mut self.library_path).hint_text("Deixe vazio para buscar automático"));
-                            ui.end_row();
+                            if self.use_hcnetsdk {
+                                ui.label("SDK Path:");
+                                ui.add_sized([field_w, field_h], egui::TextEdit::singleline(&mut self.library_path).hint_text("libhcnetsdk.so (vazio=auto)"));
+                                ui.end_row();
+                            } else {
+                                ui.label("Library Path:");
+                                ui.add_sized([field_w, field_h], egui::TextEdit::singleline(&mut self.library_path).hint_text("Deixe vazio para buscar automático"));
+                                ui.end_row();
+                            }
                         }
                     });
 
@@ -605,12 +661,14 @@ impl HikvisionApp {
                 }
 
                 ui.add_space(10.0);
-                if self.use_playctrl {
+                if self.use_hcnetsdk {
+                    ui.label(egui::RichText::new("🔐 HCNetSDK (SDK oficial). Descriptografia automática via NET_DVR_SetSDKSecretKey. Requer libhcnetsdk.so.").small().color(egui::Color32::DARK_GREEN));
+                } else if self.use_playctrl {
                     ui.label(egui::RichText::new("🔐 PlayCtrl com descriptografia. Requer libPlayCtrl.so e Verification Code do DVR.").small().color(egui::Color32::DARK_GREEN));
                 } else if self.use_snapshot {
                     ui.label(egui::RichText::new("ℹ️ Snapshot JPEG polling. ~2-3 FPS. Não requer desativar criptografia.").small().color(egui::Color32::DARK_GRAY));
                 } else {
-                    ui.label(egui::RichText::new("⚠️ RTSP direto. Se a 'Criptografia de Transmissão' estiver ativada no DVR, o vídeo não carregará. Use PlayCtrl ou Snapshot.").small().color(egui::Color32::DARK_GRAY));
+                    ui.label(egui::RichText::new("⚠️ RTSP direto. Se a 'Criptografia de Transmissão' estiver ativada no DVR, o vídeo não carregará. Use HCNetSDK, PlayCtrl ou Snapshot.").small().color(egui::Color32::DARK_GRAY));
                 }
 
                 if let Some(ref err) = self.error {
