@@ -241,7 +241,7 @@ fn main() -> Result<()> {
         eprintln!("  --rtsp-port          RTSP port (default: 554)");
         eprintln!("  --user               Username (default: admin)");
         eprintln!("  --listen             Listen addr (default: 127.0.0.1:9000)");
-        eprintln!("  --verification-code  VCode (default: KeZtid)");
+        eprintln!("  --verification-code  VCode (default: ****)");
         std::process::exit(1);
     }
 
@@ -262,7 +262,7 @@ fn main() -> Result<()> {
             "--user" => { i += 1; user = args.get(i).cloned().unwrap_or_else(|| "admin".to_string()); }
             "--password" => { i += 1; password = args.get(i).cloned().unwrap_or_default(); }
             "--listen" => { i += 1; listen = args.get(i).cloned().unwrap_or_else(|| "127.0.0.1:9000".to_string()); }
-            "--verification-code" => { i += 1; vcode = args.get(i).cloned().unwrap_or_else(|| "KeZtid".to_string()); }
+            "--verification-code" => { i += 1; vcode = args.get(i).cloned().unwrap_or_else(|| "****".to_string()); }
             _ => {}
         }
         i += 1;

@@ -40,7 +40,7 @@ pub fn snapshot_stream_loop(
                 repaint.request_repaint();
             }
             Err(e) => {
-                log::warn!("Snapshot poll error: {}", e);
+                log::warn!("Snapshot poll error for channel {}:\n{:#}", channel, e);
             }
         }
         if interval_ms > 0 {
@@ -51,6 +51,17 @@ pub fn snapshot_stream_loop(
 
 fn poll_snapshot(api: &HikvisionAPI, channel: &str) -> Result<RtspFrame> {
     let jpeg_data = api.snapshot(channel).context("snapshot request failed")?;
+
+    if jpeg_data.len() < 2 || jpeg_data[0] != 0xFF || jpeg_data[1] != 0xD8 {
+        let preview = if jpeg_data.len() > 200 {
+            String::from_utf8_lossy(&jpeg_data[..200])
+        } else {
+            String::from_utf8_lossy(&jpeg_data)
+        };
+        log::warn!("Snapshot response is not JPEG (len={}): {}", jpeg_data.len(), preview);
+        anyhow::bail!("not a valid JPEG (got {} bytes, starts with {:02X} {:02X})",
+            jpeg_data.len(), jpeg_data.first().copied().unwrap_or(0), jpeg_data.get(1).copied().unwrap_or(0));
+    }
 
     let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(&jpeg_data));
     decoder.read_info().context("JPEG read info failed")?;

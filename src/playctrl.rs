@@ -106,7 +106,7 @@ impl PlayCtrl {
         let func = get_fn!(self._lib, b"PlayM4_GetPort", unsafe extern "C" fn(*mut c_int) -> c_int);
         let mut port: c_int = -1;
         let ret = unsafe { func(&mut port) };
-        if port >= 0 || ret == 0 {
+        if Self::success(ret) && port >= 0 {
             *self.port.lock().unwrap() = Some(port);
             Ok(port)
         } else {

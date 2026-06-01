@@ -390,7 +390,7 @@ fn main() -> Result<()> {
     log::info!("Allocated decoder port {}", port);
 
     // Set secret key
-    playctrl.set_secret_key(port, "KeZtid")?;
+    playctrl.set_secret_key(port, "****")?;
     log::info!("Secret key set");
 
     // Open stream

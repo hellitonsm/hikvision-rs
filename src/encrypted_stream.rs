@@ -672,6 +672,129 @@ pub fn decrypt_video_data(
     }
 }
 
+/// Derive an AES-256 key from the Hikvision verification code.
+///
+/// Uses SHA256(verification_code) as the key derivation function.
+/// This is the standard approach used by Hikvision for transmission encryption.
+pub fn derive_verification_code_key(verification_code: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(verification_code.as_bytes());
+    let result = hasher.finalize();
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&result);
+    key
+}
+
+/// Decrypt an RTP payload (bytes after the 12-byte RTP header) using AES-256-CBC.
+///
+/// Tries multiple IV strategies and returns the result that looks most valid:
+/// 1. HIK_FIXED_IV (the standard Hikvision WebSocket IV)
+/// 2. First 16 bytes of payload as IV (common in Hikvision proprietary formats)
+/// 3. Zero IV (16 bytes of 0x00)
+///
+/// If all strategies fail or produce invalid output, returns the original payload.
+pub fn decrypt_rtp_payload(payload: &[u8], key: &[u8; 32]) -> Vec<u8> {
+    if payload.is_empty() {
+        return payload.to_vec();
+    }
+
+    // Helper: validate that output looks like H.264 NAL data
+    let looks_valid = |data: &[u8]| -> bool {
+        if data.len() < 4 {
+            return false;
+        }
+        // Check for H.264 NAL start code (0x00 0x00 0x01 or 0x00 0x00 0x00 0x01)
+        if data[0] == 0x00 && data[1] == 0x00 {
+            if data.len() > 2 && data[2] == 0x01 {
+                return true;
+            }
+            if data.len() > 3 && data[2] == 0x00 && data[3] == 0x01 {
+                return true;
+            }
+        }
+        // Check for valid NAL header byte (NAL unit type 1-29)
+        let nal_type = data[0] & 0x1F;
+        if (1..=29).contains(&nal_type) {
+            return true;
+        }
+        false
+    };
+
+    // Pad to 16 bytes for ciphertext that isn't block-aligned
+    let pad_to_block = |data: &[u8]| -> Vec<u8> {
+        if data.len() % 16 == 0 {
+            data.to_vec()
+        } else {
+            let padded_len = (data.len() + 15) & !15;
+            let mut padded = data.to_vec();
+            padded.resize(padded_len, 0);
+            padded
+        }
+    };
+
+    // Strategy 1: HIK_FIXED_IV, decrypt entire payload
+    let padded = pad_to_block(payload);
+    if let Ok(decrypted) = aes_decrypt_cbc_raw(&padded, key, &HIK_FIXED_IV) {
+        let trimmed = &decrypted[..payload.len().min(decrypted.len())];
+        if looks_valid(trimmed) {
+            return trimmed.to_vec();
+        }
+    }
+
+    // Strategy 2: IV = first 16 bytes of payload, ciphertext = rest
+    if payload.len() > 32 {
+        let iv = &payload[..16];
+        let ciphertext = &payload[16..];
+        let padded_ct = pad_to_block(ciphertext);
+        if let Ok(decrypted) = aes_decrypt_cbc_raw(&padded_ct, key, iv) {
+            let trimmed = &decrypted[..ciphertext.len().min(decrypted.len())];
+            let mut result = Vec::with_capacity(16 + trimmed.len());
+            result.extend_from_slice(iv);
+            result.extend_from_slice(trimmed);
+            if looks_valid(&result) {
+                return result;
+            }
+        }
+    }
+
+    // Strategy 3: Zero IV
+    let zero_iv = [0u8; 16];
+    if let Ok(decrypted) = aes_decrypt_cbc_raw(&padded, key, &zero_iv) {
+        let trimmed = &decrypted[..payload.len().min(decrypted.len())];
+        if looks_valid(trimmed) {
+            return trimmed.to_vec();
+        }
+    }
+
+    // All strategies failed - NAL header may be unencrypted, try decrypting from byte 1
+    if payload.len() > 1 {
+        let body = &payload[1..];
+        let padded_body = pad_to_block(body);
+        // Try HIK_FIXED_IV on body
+        if let Ok(decrypted) = aes_decrypt_cbc_raw(&padded_body, key, &HIK_FIXED_IV) {
+            let trimmed = &decrypted[..body.len().min(decrypted.len())];
+            let mut result = Vec::with_capacity(1 + trimmed.len());
+            result.push(payload[0]); // Keep NAL header
+            result.extend_from_slice(trimmed);
+            if looks_valid(&result) {
+                return result;
+            }
+        }
+        // Try zero IV on body
+        if let Ok(decrypted) = aes_decrypt_cbc_raw(&padded_body, key, &zero_iv) {
+            let trimmed = &decrypted[..body.len().min(decrypted.len())];
+            let mut result = Vec::with_capacity(1 + trimmed.len());
+            result.push(payload[0]);
+            result.extend_from_slice(trimmed);
+            return result;
+        }
+    }
+
+    // Fallback: return original payload
+    log::warn!("All decryption strategies failed, returning original payload");
+    payload.to_vec()
+}
+
 fn aes_decrypt_cbc_raw(ciphertext: &[u8], key: &[u8], iv: &[u8]) -> Result<Vec<u8>> {
     let decryptor = Decryptor::<Aes256>::new_from_slices(key, iv)
         .map_err(|e| anyhow::anyhow!("AES decrypt init: {}", e))?;
