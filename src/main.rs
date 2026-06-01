@@ -1,8 +1,11 @@
 use hikvision_rs::api::{Channel, HikvisionAPI};
+use hikvision_rs::playctrl_stream;
 use hikvision_rs::rtsp;
+use hikvision_rs::snapshot_stream;
 use eframe::egui;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::collections::HashSet;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
@@ -49,6 +52,117 @@ impl LayoutMode {
     }
 }
 
+fn config_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    PathBuf::from(home).join(".config/hikvision-rs")
+}
+
+fn config_path() -> PathBuf {
+    config_dir().join("config.json")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Config {
+    host: String,
+    port: u16,
+    rtsp_port: u16,
+    user: String,
+    password: String,
+    verification_code: String,
+    library_path: String,
+    use_substream: bool,
+    use_snapshot: bool,
+    snapshot_interval: u64,
+    use_playctrl: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            host: "192.168.5.75".to_string(),
+            port: 80,
+            rtsp_port: 554,
+            user: "admin".to_string(),
+            password: String::new(),
+            verification_code: String::new(),
+            library_path: String::new(),
+            use_substream: false,
+            use_snapshot: true,
+            snapshot_interval: 300,
+            use_playctrl: false,
+        }
+    }
+}
+
+impl Config {
+    fn load() -> Self {
+        let path = config_path();
+        if path.exists() {
+            match std::fs::read_to_string(&path) {
+                Ok(contents) => {
+                    match serde_json::from_str(&contents) {
+                        Ok(cfg) => {
+                            log::info!("Config loaded from {}", path.display());
+                            return cfg;
+                        }
+                        Err(e) => log::warn!("Failed to parse config: {}", e),
+                    }
+                }
+                Err(e) => log::warn!("Failed to read config: {}", e),
+            }
+        }
+        Default::default()
+    }
+
+    fn save(&self) {
+        let dir = config_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            log::warn!("Failed to create config dir {}: {}", dir.display(), e);
+            return;
+        }
+        let path = config_path();
+        match serde_json::to_string_pretty(self) {
+            Ok(contents) => {
+                match std::fs::write(&path, &contents) {
+                    Ok(()) => log::info!("Config saved to {}", path.display()),
+                    Err(e) => log::warn!("Failed to save config: {}", e),
+                }
+            }
+            Err(e) => log::warn!("Failed to serialize config: {}", e),
+        }
+    }
+
+    fn apply(&self, app: &mut HikvisionApp) {
+        app.host = self.host.clone();
+        app.port = self.port.to_string();
+        app.rtsp_port = self.rtsp_port.to_string();
+        app.user = self.user.clone();
+        app.password = self.password.clone();
+        app.verification_code = self.verification_code.clone();
+        app.library_path = self.library_path.clone();
+        app.use_substream = self.use_substream;
+        app.use_snapshot = self.use_snapshot;
+        app.snapshot_interval = self.snapshot_interval;
+        app.use_playctrl = self.use_playctrl;
+    }
+
+    fn from_app(app: &HikvisionApp) -> Self {
+        Self {
+            host: app.host.trim().to_string(),
+            port: app.port.trim().parse().unwrap_or(80),
+            rtsp_port: app.rtsp_port.trim().parse().unwrap_or(554),
+            user: app.user.trim().to_string(),
+            password: app.password.clone(),
+            verification_code: app.verification_code.clone(),
+            library_path: app.library_path.clone(),
+            use_substream: app.use_substream,
+            use_snapshot: app.use_snapshot,
+            snapshot_interval: app.snapshot_interval,
+            use_playctrl: app.use_playctrl,
+        }
+    }
+}
+
 struct StreamState {
     texture: Option<egui::TextureHandle>,
     frame_width: usize,
@@ -83,7 +197,12 @@ struct HikvisionApp {
     rtsp_port: String,
     user: String,
     password: String,
+    verification_code: String,
+    library_path: String,
     use_substream: bool,
+    use_snapshot: bool,
+    snapshot_interval: u64,
+    use_playctrl: bool,
 
     api: Option<HikvisionAPI>,
     channels: Vec<Channel>,
@@ -104,7 +223,12 @@ impl Default for HikvisionApp {
             rtsp_port: "554".into(),
             user: "admin".into(),
             password: String::new(),
+            verification_code: String::new(),
+            library_path: String::new(),
             use_substream: false,
+            use_snapshot: true,
+            snapshot_interval: 300,
+            use_playctrl: false,
             api: None,
             channels: Vec::new(),
             device_name: String::new(),
@@ -132,6 +256,11 @@ impl HikvisionApp {
 
         if host.is_empty() {
             self.error = Some("Host is required".into());
+            return;
+        }
+
+        if self.use_playctrl && self.verification_code.trim().is_empty() {
+            self.error = Some("Verification Code é obrigatório quando PlayCtrl está ativo".into());
             return;
         }
 
@@ -164,6 +293,8 @@ impl HikvisionApp {
                         };
                         self.api = Some(api);
                         self.error = None;
+
+                        Config::from_app(self).save();
                     }
                     Err(e) => self.error = Some(format!("Channels failed: {}", e)),
                 }
@@ -240,11 +371,22 @@ impl HikvisionApp {
             self.layout_mode,
             LayoutMode::Grid2x2 | LayoutMode::Grid3x3 | LayoutMode::Grid4x4
         );
+
+        let host = self.host.trim().to_string();
+        let port: u16 = self.port.trim().parse().unwrap_or(80);
+        let rtsp_port: u16 = self.rtsp_port.trim().parse().unwrap_or(554);
+        let user = self.user.trim().to_string();
+        let password = self.password.clone();
+        let interval = self.snapshot_interval;
+        let use_snapshot = self.use_snapshot;
+        let use_playctrl = self.use_playctrl;
+        let verification_code = self.verification_code.clone();
+        let library_path = self.library_path.clone();
         let url = self.rtsp_url(&channel_id, force_sub);
-        log::info!("Starting stream for channel {}: {}", channel_id, channel_name);
 
         let (tx, rx) = mpsc::sync_channel::<rtsp::RtspFrame>(2);
         let stop = Arc::new(AtomicBool::new(false));
+        let repaint_ctx = ctx.clone();
 
         let state = &mut self.streams[channel_index];
         state.frame_rx = Some(rx);
@@ -253,11 +395,38 @@ impl HikvisionApp {
         state.fps_timer = Instant::now();
         state.fps = 0.0;
 
-        let repaint_ctx = ctx.clone();
-        let handle = thread::spawn(move || {
-            rtsp::stream_loop(&url, tx, stop, repaint_ctx);
-        });
-        state.stream_handle = Some(handle);
+        if use_snapshot {
+            log::info!("Starting snapshot stream for channel {}: {}", channel_id, channel_name);
+            let cid = channel_id.clone();
+            let handle = thread::spawn(move || {
+                snapshot_stream::snapshot_stream_loop(
+                    &cid, &host, port, &user, &password, tx, stop, repaint_ctx, interval,
+                );
+            });
+            state.stream_handle = Some(handle);
+        } else if use_playctrl {
+            log::info!("Starting PlayCtrl stream for channel {}: {}", channel_id, channel_name);
+            let lp = if library_path.is_empty() {
+                None
+            } else {
+                Some(library_path)
+            };
+            let cid = channel_id.clone();
+            let handle = thread::spawn(move || {
+                playctrl_stream::stream_loop(
+                    &host, rtsp_port, &cid, &user, &password,
+                    &verification_code, lp.as_deref(),
+                    tx, stop, repaint_ctx,
+                );
+            });
+            state.stream_handle = Some(handle);
+        } else {
+            log::info!("Starting RTSP stream for channel {}: {}", channel_id, channel_name);
+            let handle = thread::spawn(move || {
+                rtsp::stream_loop(&url, tx, stop, repaint_ctx);
+            });
+            state.stream_handle = Some(handle);
+        }
     }
 
     fn stop_stream(&mut self, channel_index: usize) {
@@ -320,7 +489,7 @@ impl HikvisionApp {
             ui.vertical_centered(|ui| {
                 ui.add_space(100.0);
                 ui.heading("Hikvision DVR Viewer");
-                ui.label("RTSP Streaming");
+                ui.label("Streaming via ISAPI & RTSP");
                 ui.add_space(20.0);
 
                 let field_w = 320.0;
@@ -347,6 +516,25 @@ impl HikvisionApp {
                         ui.label("");
                         ui.checkbox(&mut self.use_substream, "Sub-stream (menor resolução, mais leve)");
                         ui.end_row();
+                        ui.label("");
+                        ui.checkbox(&mut self.use_snapshot, "Snapshot (JPEG polling, funciona com criptografia)");
+                        ui.end_row();
+                        if self.use_snapshot {
+                            ui.label("Intervalo (ms):");
+                            ui.add(egui::Slider::new(&mut self.snapshot_interval, 100u64..=2000).suffix("ms"));
+                            ui.end_row();
+                        }
+                        ui.label("");
+                        ui.checkbox(&mut self.use_playctrl, "Usar PlayCtrl (descriptografia)");
+                        ui.end_row();
+                        if self.use_playctrl {
+                            ui.label("Verification Code:");
+                            ui.add_sized([field_w, field_h], egui::TextEdit::singleline(&mut self.verification_code).password(true));
+                            ui.end_row();
+                            ui.label("Library Path:");
+                            ui.add_sized([field_w, field_h], egui::TextEdit::singleline(&mut self.library_path).hint_text("Deixe vazio para buscar automático"));
+                            ui.end_row();
+                        }
                     });
 
                 ui.add_space(10.0);
@@ -355,7 +543,13 @@ impl HikvisionApp {
                 }
 
                 ui.add_space(10.0);
-                ui.label(egui::RichText::new("⚠️ Atenção: Se a 'Criptografia de Transmissão' (Verification Code) estiver ativada no DVR, o vídeo não carregará. Desative-a no menu de Rede do DVR.").small().color(egui::Color32::DARK_GRAY));
+                if self.use_playctrl {
+                    ui.label(egui::RichText::new("🔐 PlayCtrl com descriptografia. Requer libPlayCtrl.so e Verification Code do DVR.").small().color(egui::Color32::DARK_GREEN));
+                } else if self.use_snapshot {
+                    ui.label(egui::RichText::new("ℹ️ Snapshot JPEG polling. ~2-3 FPS. Não requer desativar criptografia.").small().color(egui::Color32::DARK_GRAY));
+                } else {
+                    ui.label(egui::RichText::new("⚠️ RTSP direto. Se a 'Criptografia de Transmissão' estiver ativada no DVR, o vídeo não carregará. Use PlayCtrl ou Snapshot.").small().color(egui::Color32::DARK_GRAY));
+                }
 
                 if let Some(ref err) = self.error {
                     ui.colored_label(egui::Color32::RED, err);
@@ -401,6 +595,13 @@ impl HikvisionApp {
             .default_width(200.0)
             .show(ctx, |ui| {
                 ui.heading("Channels");
+                if self.use_playctrl {
+                    ui.label(egui::RichText::new("🔐 PlayCtrl decrypt").small().color(egui::Color32::DARK_GREEN));
+                } else if self.use_snapshot {
+                    ui.label(egui::RichText::new("📷 Snapshot JPEG").small().color(egui::Color32::GREEN));
+                } else {
+                    ui.label(egui::RichText::new("🎥 RTSP stream").small().color(egui::Color32::LIGHT_BLUE));
+                }
                 ui.separator();
 
                 egui::ComboBox::from_label("Layout")
@@ -514,7 +715,13 @@ impl HikvisionApp {
                 ui.add_space(100.0);
                 if self.streams[idx].stream_handle.is_some() {
                     ui.spinner();
-                    ui.label("Connecting to RTSP stream...");
+                    if self.use_playctrl {
+                        ui.label("PlayCtrl decrypting...");
+                    } else if self.use_snapshot {
+                        ui.label("Polling snapshot...");
+                    } else {
+                        ui.label("Connecting to RTSP stream...");
+                    }
                 } else {
                     ui.label("Select a channel to view");
                 }
@@ -616,9 +823,9 @@ impl HikvisionApp {
             ui.add_space(cell_size.y * 0.35);
             ui.colored_label(egui::Color32::GRAY, &channel_name);
             if state.stream_handle.is_some() {
-                ui.colored_label(egui::Color32::DARK_GRAY, "Connecting...");
+                ui.colored_label(egui::Color32::DARK_GRAY, "Aguardando...");
             } else {
-                ui.colored_label(egui::Color32::DARK_GRAY, "No Signal");
+                ui.colored_label(egui::Color32::DARK_GRAY, "Sem Sinal");
             }
         }
     }
@@ -646,6 +853,10 @@ fn main() {
     ffmpeg_next::init().expect("Failed to initialize FFmpeg");
     ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Warning);
 
+    let config = Config::load();
+    let mut app = HikvisionApp::default();
+    config.apply(&mut app);
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 720.0]),
         ..Default::default()
@@ -653,6 +864,6 @@ fn main() {
     let _ = eframe::run_native(
         "Hikvision DVR Viewer",
         options,
-        Box::new(|_cc| Ok(Box::new(HikvisionApp::default()))),
+        Box::new(move |_cc| Ok(Box::new(app))),
     );
 }

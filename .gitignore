@@ -17,3 +17,12 @@ Thumbs.db
 
 # antigravitycli
 .antigravitycli/
+
+# Config with credentials
+config.json
+
+# Hikvision SDK libs
+hikvision-libs/
+
+#newqtDemo
+newqtdemo/

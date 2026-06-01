@@ -1,0 +1,13 @@
+{
+  "host": "192.168.5.75",
+  "port": 80,
+  "rtsp_port": 554,
+  "user": "admin",
+  "password": "",
+  "verification_code": "",
+  "library_path": "",
+  "use_substream": false,
+  "use_playctrl": false,
+  "use_snapshot": true,
+  "snapshot_interval": 300
+}

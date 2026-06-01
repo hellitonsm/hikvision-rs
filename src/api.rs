@@ -1,33 +1,138 @@
+//! # Autenticação ISAPI (HTTP Digest)
+//!
+//! Este módulo implementa o cliente HTTP para a API ISAPI da Hikvision,
+//! utilizando **HTTP Digest Access Authentication** (RFC 2617) para
+//! autenticação nas câmeras/DVRs.
+//!
+//! ## Fluxo de Autenticação
+//!
+//! O handshake Digest ocorre em duas etapas:
+//!
+//! 1. **Requisição sem credenciais** — O cliente envia um GET para o endpoint
+//!    (`/ISAPI/System/deviceInfo`). O servidor responde com `401 Unauthorized`
+//!    e um cabeçalho `WWW-Authenticate: Digest ...` contendo os parâmetros do
+//!    desafio (`realm`, `nonce`, `qop`, `opaque`, `algorithm`).
+//!
+//! 2. **Requisição com Digest** — O cliente computa a resposta MD5 com base nos
+//!    parâmetros do desafio + credenciais e reenvia a requisição com o cabeçalho
+//!    `Authorization: Digest ...`. O servidor valida e retorna `200 OK` com os
+//!    dados XML.
+//!
+//! O cabeçalho `auth_header` é cacheado em [`HikvisionAPI`] via `RefCell`, evitando
+//! o round-trip 401 em requisições subsequentes. Se o servidor rejeitar o cabeçalho
+//! cacheado (novo 401), a autenticação é refeita automaticamente.
+//!
+//! ## Endpoints ISAPI utilizados
+//!
+//! | Endpoint | Método | Descrição |
+//! |---|---|---|
+//! | `/ISAPI/System/deviceInfo` | GET | Informações do dispositivo (modelo, serial, firmware). Usado como *probe* de autenticação. |
+//! | `/ISAPI/Streaming/channels` | GET | Lista de canais de vídeo disponíveis. |
+//! | `/ISAPI/Streaming/channels/{id}/picture` | GET | Snapshot JPEG de um canal. |
+//!
+//! ## Algoritmo Digest (MD5)
+//!
+//! ```text
+//! HA1    = MD5( usuário : realm : senha )
+//! HA2    = MD5( método  : uri   )
+//! cnonce = MD5( nonce   : usuário )
+//! response = MD5( HA1 : nonce : nc : cnonce : qop : HA2 )
+//! ```
+//!
+//! Onde `nc` (nonce count) é fixo em `00000001`, e o `qop` (quality of protection)
+//! é `auth`.
+
 use anyhow::{Context, Result};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use std::cell::RefCell;
 use ureq;
 
+/// Representa um canal de vídeo do DVR.
+///
+/// Cada canal possui um identificador numérico (ex: `"101"`, `"102"`) e um
+/// nome descritivo (ex: `"Camera 1"`). O ID é usado para montar as URLs de
+/// streaming RTSP e snapshot.
 #[derive(Debug, Clone)]
 pub struct Channel {
+    /// ID do canal no formato Hikvision (ex: `"101"` para canal 1, stream principal).
     pub id: String,
+    /// Nome descritivo do canal configurado no DVR.
     pub name: String,
 }
 
+/// Informações do dispositivo retornadas pelo endpoint `/ISAPI/System/deviceInfo`.
+///
+/// Contém os dados básicos de identificação da câmera/DVR, obtidos após
+/// autenticação bem-sucedida. Usado como prova de que a conexão está ativa.
 #[derive(Debug)]
 pub struct DeviceInfo {
+    /// Modelo do dispositivo (ex: `"DS-7608NI-I2/8P"`).
     pub model: String,
+    /// Número de série do dispositivo.
     pub serial: String,
+    /// Versão do firmware (ex: `"V4.30.110"`).
     pub firmware: String,
+    /// Nome do dispositivo configurado pelo usuário.
     pub name: String,
 }
 
+/// Cliente HTTP para a API ISAPI da Hikvision com autenticação Digest.
+///
+/// # Funcionamento
+///
+/// 1. [`HikvisionAPI::new`] cria o cliente com as credenciais da câmera.
+/// 2. [`HikvisionAPI::device_info`] faz o primeiro request, que dispara o
+///    handshake Digest (401 → computa hash → retry com Authorization).
+/// 3. O cabeçalho `Authorization` é cacheado em [`auth_header`](HikvisionAPI::auth_header)
+///    para reuso em chamadas seguintes ([`channels`](HikvisionAPI::channels),
+///    [`snapshot`](HikvisionAPI::snapshot)).
+///
+/// # Cache do cabeçalho
+///
+/// O campo `auth_header` é um `RefCell<Option<String>>` porque o cache precisa
+/// ser compartilhado entre chamadas imutáveis (&self). Se o servidor rejeitar
+/// o header cacheado, `request_inner` limpa o cache e refaz o handshake.
+///
+/// # Exemplo
+///
+/// ```no_run
+/// use hikvision_rs::api::HikvisionAPI;
+///
+/// let api = HikvisionAPI::new("192.168.1.100", 80, "admin", "senha123");
+/// match api.device_info() {
+///     Ok(info) => println!("Conectado: {} ({})", info.name, info.model),
+///     Err(e) => eprintln!("Falha na autenticação: {}", e),
+/// }
+/// ```
 #[derive(Clone)]
 pub struct HikvisionAPI {
+    /// Agente HTTP reutilizável (ureq). Configurado para não tratar códigos
+    /// HTTP 4xx/5xx como erro, permitindo capturar o 401 manualmente.
     agent: ureq::Agent,
+    /// URL base da câmera, montada como `http://{host}:{port}`.
     base: String,
+    /// Nome de usuário para autenticação na câmera.
     user: String,
+    /// Senha do usuário para autenticação na câmera.
     password: String,
+    /// Cabeçalho `Authorization: Digest ...` cacheado.
+    /// `None` = ainda não autenticou; `Some("Digest ...")` = reutilizar.
     auth_header: RefCell<Option<String>>,
 }
 
 impl HikvisionAPI {
+    /// Cria um novo cliente HTTP para a API ISAPI.
+    ///
+    /// # Parâmetros
+    ///
+    /// * `host` — Endereço IP ou hostname da câmera/DVR.
+    /// * `port` — Porta HTTP (padrão Hikvision: `80`).
+    /// * `user` — Nome de usuário para autenticação.
+    /// * `password` — Senha do usuário.
+    ///
+    /// O `ureq::Agent` é configurado com `http_status_as_error(false)` para que
+    /// respostas 401 possam ser inspecionadas manualmente durante o handshake Digest.
     pub fn new(host: &str, port: u16, user: &str, password: &str) -> Self {
         let agent = ureq::Agent::new_with_config(
             ureq::config::Config::builder()
@@ -43,6 +148,21 @@ impl HikvisionAPI {
         }
     }
 
+    /// Executa uma requisição HTTP com suporte a Digest Authentication.
+    ///
+    /// # Fluxo interno
+    ///
+    /// 1. Tenta a requisição **sem** `Authorization` (ou com o header cacheado,
+    ///    se disponível).
+    /// 2. Se o servidor responder `401`:
+    ///    - Extrai o cabeçalho `WWW-Authenticate` com os parâmetros do desafio.
+    ///    - Computa o Digest via [`compute_digest`].
+    ///    - Cacheia o resultado em `self.auth_header`.
+    ///    - Descarrega o body da resposta 401.
+    ///    - Reenvia a requisição com o cabeçalho `Authorization: Digest ...`.
+    /// 3. Se o retry também der `401`, retorna erro `"Digest auth failed"`.
+    /// 4. Se a resposta inicial (sem auth) já for `< 400`, retorna direto
+    ///    (caso raro em câmeras sem autenticação).
     fn request_inner(&self, method: &str, path: &str) -> Result<ureq::http::Response<ureq::Body>> {
         let url = format!("{}{}", self.base, path);
         log::debug!("{} {}", method, url);
@@ -96,6 +216,10 @@ impl HikvisionAPI {
         Ok(resp)
     }
 
+    /// Faz um GET e retorna o body como string.
+    ///
+    /// Usado internamente por [`device_info`](HikvisionAPI::device_info) e
+    /// [`channels`](HikvisionAPI::channels).
     fn get_text(&self, path: &str) -> Result<String> {
         let mut resp = self.request_inner("GET", path)?;
         Ok(resp
@@ -104,6 +228,9 @@ impl HikvisionAPI {
             .context("body read failed")?)
     }
 
+    /// Faz um GET e retorna o body como bytes.
+    ///
+    /// Usado por [`snapshot`](HikvisionAPI::snapshot) para obter imagens JPEG.
     fn get_bytes(&self, path: &str) -> Result<Vec<u8>> {
         let mut resp = self.request_inner("GET", path)?;
         Ok(resp
@@ -112,24 +239,64 @@ impl HikvisionAPI {
             .context("body read failed")?)
     }
 
+    /// Obtém informações do dispositivo (`/ISAPI/System/deviceInfo`).
+    ///
+    /// Este é o **primeiro endpoint chamado após a conexão**. Ele serve como
+    /// *probe* de autenticação: se as credenciais estiverem corretas, o
+    /// handshake Digest ocorre silenciosamente e o XML de resposta é parseado
+    /// em [`DeviceInfo`].
+    ///
+    /// # Erros
+    ///
+    /// Retorna erro se:
+    /// - A câmera não responder (timeout, rede, etc.).
+    /// - As credenciais forem inválidas (401 persistente).
+    /// - O XML de resposta for mal-formado.
     pub fn device_info(&self) -> Result<DeviceInfo> {
         log::info!("Fetching device info");
         let xml = self.get_text("/ISAPI/System/deviceInfo")?;
         parse_device_info(&xml)
     }
 
+    /// Lista os canais de vídeo disponíveis (`/ISAPI/Streaming/channels`).
+    ///
+    /// Deve ser chamado **após** [`device_info`](HikvisionAPI::device_info) —
+    /// o cabeçalho Digest já estará cacheado e esta chamada não disparará
+    /// um novo handshake.
+    ///
+    /// # Formato dos IDs
+    ///
+    /// Os IDs dos canais seguem o padrão Hikvision:
+    /// - Canal 1, stream principal → `"101"`
+    /// - Canal 1, sub-stream → `"102"`
+    /// - Canal 2, stream principal → `"201"`
+    /// - Canal 2, sub-stream → `"202"`
     pub fn channels(&self) -> Result<Vec<Channel>> {
         log::info!("Fetching channel list");
         let xml = self.get_text("/ISAPI/Streaming/channels")?;
         parse_channels(&xml)
     }
 
+    /// Obtém um snapshot JPEG de um canal (`/ISAPI/Streaming/channels/{cid}/picture`).
+    ///
+    /// Retorna os bytes brutos da imagem JPEG. Pode ser usado para gerar
+    /// thumbnails ou verificação visual sem abrir stream RTSP.
     pub fn snapshot(&self, cid: &str) -> Result<Vec<u8>> {
         let path = format!("/ISAPI/Streaming/channels/{}/picture", cid);
         self.get_bytes(&path)
     }
 }
 
+/// Parseia o cabeçalho `WWW-Authenticate: Digest ...` em pares chave/valor.
+///
+/// # Formato esperado
+///
+/// ```text
+/// Digest realm="Hikvision", nonce="abc123", qop="auth", opaque="def456", algorithm="MD5"
+/// ```
+///
+/// Remove o prefixo `"Digest "` e separa por vírgulas, extraindo `key=value`
+/// e removendo as aspas dos valores.
 fn parse_digest_params(challenge: &str) -> Vec<(String, String)> {
     let challenge = challenge.trim();
     if !challenge.starts_with("Digest ") {
@@ -148,6 +315,7 @@ fn parse_digest_params(challenge: &str) -> Vec<(String, String)> {
     params
 }
 
+/// Busca um parâmetro pelo nome (case-insensitive) na lista de pares.
 fn param<'a>(params: &'a [(String, String)], name: &str) -> Option<&'a str> {
     params
         .iter()
@@ -155,6 +323,32 @@ fn param<'a>(params: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
+/// Computa o cabeçalho `Authorization: Digest ...` conforme RFC 2617.
+///
+/// # Algoritmo
+///
+/// ```text
+/// HA1    = MD5( user : realm : password )
+/// HA2    = MD5( method : uri )
+/// cnonce = MD5( nonce : user )
+/// nc     = "00000001"
+///
+/// IF qop = "auth" ou vazio:
+///   response = MD5( HA1 : nonce : nc : cnonce : qop : HA2 )
+/// ELSE:
+///   response = MD5( HA1 : nonce : HA2 )
+/// ```
+///
+/// O `cnonce` (client nonce) único é derivado de `MD5(nonce + user)` para
+/// garantir variabilidade mesmo com o mesmo `nc`.
+///
+/// # Parâmetros
+///
+/// * `challenge` — Cabeçalho `WWW-Authenticate: Digest ...` recebido do servidor.
+/// * `method` — Método HTTP (ex: `"GET"`).
+/// * `uri` — Caminho da requisição (ex: `"/ISAPI/System/deviceInfo"`).
+/// * `user` — Nome de usuário.
+/// * `password` — Senha do usuário.
 fn compute_digest(
     challenge: &str,
     method: &str,
@@ -211,11 +405,19 @@ fn compute_digest(
 
 // -- XML parsing (unchanged) --
 
+/// Remove namespaces XML do formato Hikvision para simplificar o parsing.
+///
+/// A API Hikvision retorna XML com namespace `xmlns="http://www.hikvision.com/ver20/XMLSchema"`,
+/// que o `quick_xml` não lida bem em modo simples. Esta função remove as declarações
+/// de namespace antes do parsing.
 fn strip_ns(xml: &str) -> String {
     xml.replace(" xmlns=\"http://www.hikvision.com/ver20/XMLSchema\"", "")
         .replace(" xmlns=\"\"", "")
 }
 
+/// Parseia o XML de `/ISAPI/System/deviceInfo` em um [`DeviceInfo`].
+///
+/// Extrai os campos `model`, `serialNumber`, `firmwareVersion` e `deviceName`.
 fn parse_device_info(xml: &str) -> Result<DeviceInfo> {
     let xml = strip_ns(xml);
     let mut reader = Reader::from_str(&xml);
@@ -249,6 +451,10 @@ fn parse_device_info(xml: &str) -> Result<DeviceInfo> {
     Ok(info)
 }
 
+/// Parseia o XML de `/ISAPI/Streaming/channels` em uma lista de [`Channel`].
+///
+/// Cada `<StreamingChannel>` contém `<id>` (ex: `101`) e `<channelName>` (ex: `"Camera 1"`).
+/// Canais sem ID são ignorados.
 fn parse_channels(xml: &str) -> Result<Vec<Channel>> {
     let xml = strip_ns(xml);
     let mut reader = Reader::from_str(&xml);
