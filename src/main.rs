@@ -12,6 +12,39 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+enum StreamMethod {
+    Rtsp,
+    Snapshot,
+    PlayCtrl,
+    ZeroChannel,
+    HCNetSDK,
+}
+
+impl StreamMethod {
+    fn label(&self) -> &'static str {
+        match self {
+            StreamMethod::Rtsp => "RTSP (direto)",
+            StreamMethod::Snapshot => "Snapshot (JPEG polling)",
+            StreamMethod::PlayCtrl => "PlayCtrl (descriptografia)",
+            StreamMethod::ZeroChannel => "Canal Zero (stream multiplexado)",
+            StreamMethod::HCNetSDK => "HCNetSDK (SDK oficial)",
+        }
+    }
+
+    fn needs_verification_code(&self) -> bool {
+        matches!(self, StreamMethod::PlayCtrl | StreamMethod::ZeroChannel | StreamMethod::HCNetSDK)
+    }
+
+    fn needs_sdk_library(&self) -> bool {
+        matches!(self, StreamMethod::PlayCtrl | StreamMethod::HCNetSDK)
+    }
+
+    fn show_sdk_port(&self) -> bool {
+        matches!(self, StreamMethod::HCNetSDK)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum LayoutMode {
     Single,
@@ -66,17 +99,15 @@ fn config_path() -> PathBuf {
 struct Config {
     host: String,
     port: u16,
+    sdk_port: u16,
     rtsp_port: u16,
     user: String,
     password: String,
     verification_code: String,
     library_path: String,
     use_substream: bool,
-    use_snapshot: bool,
+    stream_method: StreamMethod,
     snapshot_interval: u64,
-    use_playctrl: bool,
-    use_zero_channel: bool,
-    use_hcnetsdk: bool,
 }
 
 impl Default for Config {
@@ -84,17 +115,15 @@ impl Default for Config {
         Self {
             host: "192.168.5.75".to_string(),
             port: 80,
+            sdk_port: 8000,
             rtsp_port: 554,
             user: "admin".to_string(),
             password: String::new(),
             verification_code: String::new(),
             library_path: String::new(),
             use_substream: false,
-            use_snapshot: true,
+            stream_method: StreamMethod::Snapshot,
             snapshot_interval: 300,
-            use_playctrl: false,
-            use_zero_channel: false,
-            use_hcnetsdk: false,
         }
     }
 }
@@ -105,13 +134,58 @@ impl Config {
         if path.exists() {
             match std::fs::read_to_string(&path) {
                 Ok(contents) => {
-                    match serde_json::from_str(&contents) {
-                        Ok(cfg) => {
-                            log::info!("Config loaded from {}", path.display());
-                            return cfg;
-                        }
-                        Err(e) => log::warn!("Failed to parse config: {}", e),
+                    // Tenta parser novo formato (com stream_method)
+                    if let Ok(cfg) = serde_json::from_str::<Config>(&contents) {
+                        log::info!("Config loaded from {}", path.display());
+                        return cfg;
                     }
+                    // Fallback: migra do formato antigo (bool individuais)
+                    #[derive(Deserialize)]
+                    struct OldConfig {
+                        host: String,
+                        port: u16,
+                        sdk_port: Option<u16>,
+                        rtsp_port: u16,
+                        user: String,
+                        password: String,
+                        verification_code: Option<String>,
+                        library_path: Option<String>,
+                        use_substream: Option<bool>,
+                        use_snapshot: Option<bool>,
+                        use_playctrl: Option<bool>,
+                        use_zero_channel: Option<bool>,
+                        use_hcnetsdk: Option<bool>,
+                        snapshot_interval: Option<u64>,
+                    }
+                    if let Ok(old) = serde_json::from_str::<OldConfig>(&contents) {
+                        log::info!("Migrating config from old format");
+                        let stream_method = if old.use_hcnetsdk.unwrap_or(false) {
+                            StreamMethod::HCNetSDK
+                        } else if old.use_zero_channel.unwrap_or(false) {
+                            StreamMethod::ZeroChannel
+                        } else if old.use_playctrl.unwrap_or(false) {
+                            StreamMethod::PlayCtrl
+                        } else if old.use_snapshot.unwrap_or(true) {
+                            StreamMethod::Snapshot
+                        } else {
+                            StreamMethod::Rtsp
+                        };
+                        let cfg = Config {
+                            host: old.host,
+                            port: old.port,
+                            sdk_port: old.sdk_port.unwrap_or(8000),
+                            rtsp_port: old.rtsp_port,
+                            user: old.user,
+                            password: old.password,
+                            verification_code: old.verification_code.unwrap_or_default(),
+                            library_path: old.library_path.unwrap_or_default(),
+                            use_substream: old.use_substream.unwrap_or(false),
+                            stream_method,
+                            snapshot_interval: old.snapshot_interval.unwrap_or(300),
+                        };
+                        return cfg;
+                    }
+                    log::warn!("Failed to parse config (tried old format too), using defaults");
                 }
                 Err(e) => log::warn!("Failed to read config: {}", e),
             }
@@ -140,34 +214,30 @@ impl Config {
     fn apply(&self, app: &mut HikvisionApp) {
         app.host = self.host.clone();
         app.port = self.port.to_string();
+        app.sdk_port = self.sdk_port.to_string();
         app.rtsp_port = self.rtsp_port.to_string();
         app.user = self.user.clone();
         app.password = self.password.clone();
         app.verification_code = self.verification_code.clone();
         app.library_path = self.library_path.clone();
         app.use_substream = self.use_substream;
-        app.use_snapshot = self.use_snapshot;
+        app.stream_method = self.stream_method;
         app.snapshot_interval = self.snapshot_interval;
-        app.use_playctrl = self.use_playctrl;
-        app.use_zero_channel = self.use_zero_channel;
-        app.use_hcnetsdk = self.use_hcnetsdk;
     }
 
     fn from_app(app: &HikvisionApp) -> Self {
         Self {
             host: app.host.trim().to_string(),
             port: app.port.trim().parse().unwrap_or(80),
+            sdk_port: app.sdk_port.trim().parse().unwrap_or(8000),
             rtsp_port: app.rtsp_port.trim().parse().unwrap_or(554),
             user: app.user.trim().to_string(),
             password: app.password.clone(),
             verification_code: app.verification_code.clone(),
             library_path: app.library_path.clone(),
             use_substream: app.use_substream,
-            use_snapshot: app.use_snapshot,
+            stream_method: app.stream_method,
             snapshot_interval: app.snapshot_interval,
-            use_playctrl: app.use_playctrl,
-            use_zero_channel: app.use_zero_channel,
-            use_hcnetsdk: app.use_hcnetsdk,
         }
     }
 }
@@ -203,17 +273,15 @@ impl StreamState {
 struct HikvisionApp {
     host: String,
     port: String,
+    sdk_port: String,
     rtsp_port: String,
     user: String,
     password: String,
     verification_code: String,
     library_path: String,
     use_substream: bool,
-    use_snapshot: bool,
+    stream_method: StreamMethod,
     snapshot_interval: u64,
-    use_playctrl: bool,
-    use_zero_channel: bool,
-    use_hcnetsdk: bool,
 
     api: Option<HikvisionAPI>,
     channels: Vec<Channel>,
@@ -232,17 +300,15 @@ impl Default for HikvisionApp {
         Self {
             host: "192.168.5.75".into(),
             port: "80".into(),
+            sdk_port: "8000".into(),
             rtsp_port: "554".into(),
             user: "admin".into(),
             password: String::new(),
             verification_code: String::new(),
             library_path: String::new(),
             use_substream: false,
-            use_snapshot: true,
+            stream_method: StreamMethod::Snapshot,
             snapshot_interval: 300,
-            use_playctrl: false,
-            use_zero_channel: false,
-            use_hcnetsdk: false,
             api: None,
             channels: Vec::new(),
             device_name: String::new(),
@@ -274,8 +340,8 @@ impl HikvisionApp {
             return;
         }
 
-        if self.use_playctrl && self.verification_code.trim().is_empty() {
-            self.error = Some("Verification Code é obrigatório quando PlayCtrl está ativo".into());
+        if self.stream_method.needs_verification_code() && self.verification_code.trim().is_empty() {
+            self.error = Some("Verification Code é obrigatório para este método de streaming".into());
             return;
         }
 
@@ -286,7 +352,7 @@ impl HikvisionApp {
                     format!("{} | {} | {}", info.name, info.model, info.firmware);
                 self.device_supports_zero_channel = info.zero_chan_num > 0;
 
-                if self.use_zero_channel && !self.device_supports_zero_channel {
+                if self.stream_method == StreamMethod::ZeroChannel && !self.device_supports_zero_channel {
                     log::warn!("Canal Zero solicitado mas dispositivo não suporta (zeroChanNum={})", info.zero_chan_num);
                     self.error = Some("Dispositivo não suporta Canal Zero. Desative a opção ou ative no DVR.".into());
                     return;
@@ -309,7 +375,7 @@ impl HikvisionApp {
                                 }
                             }
                         }
-                        if self.use_zero_channel {
+                        if self.stream_method == StreamMethod::ZeroChannel {
                             if !deduped.iter().any(|c| c.id == "001") {
                                 deduped.insert(0, Channel {
                                     id: "001".to_string(),
@@ -417,13 +483,12 @@ impl HikvisionApp {
 
         let host = self.host.trim().to_string();
         let port: u16 = self.port.trim().parse().unwrap_or(80);
+        let sdk_port: u16 = self.sdk_port.trim().parse().unwrap_or(8000);
         let rtsp_port: u16 = self.rtsp_port.trim().parse().unwrap_or(554);
         let user = self.user.trim().to_string();
         let password = self.password.clone();
         let interval = self.snapshot_interval;
-        let use_snapshot = self.use_snapshot;
-        let use_playctrl = self.use_playctrl;
-        let use_hcnetsdk = self.use_hcnetsdk;
+        let method = self.stream_method;
         let verification_code = self.verification_code.clone();
         let library_path = self.library_path.clone();
         let url = self.rtsp_url(&channel_id, force_sub);
@@ -439,89 +504,76 @@ impl HikvisionApp {
         state.fps_timer = Instant::now();
         state.fps = 0.0;
 
-        if is_zero_ch {
-            // Canal zero: RTP payload has visible NAL headers but encrypted NAL body.
-            // Uses custom RTSP client + manual AES decryption + FFmpeg H.264 decoder.
-            // Bypasses PlayCtrl (which can't handle canal 001's multiplexed format).
-            log::info!("Starting zero-channel stream (FFmpeg+decrypt) for {}: {}", channel_id, channel_name);
-            if verification_code.trim().is_empty() {
-                log::error!("Canal Zero requer Verification Code para descriptografia");
-                return;
+        match method {
+            StreamMethod::ZeroChannel => {
+                log::info!("Starting zero-channel stream (FFmpeg+decrypt) for {}: {}", channel_id, channel_name);
+                if verification_code.trim().is_empty() {
+                    log::error!("Canal Zero requer Verification Code para descriptografia");
+                    return;
+                }
+                let cid = channel_id.clone();
+                let handle = thread::spawn(move || {
+                    playctrl_stream::zero_channel_stream_loop(
+                        &host, rtsp_port, &cid, &user, &password,
+                        &verification_code,
+                        tx, stop, repaint_ctx,
+                    );
+                });
+                state.stream_handle = Some(handle);
             }
-            let cid = channel_id.clone();
-            let handle = thread::spawn(move || {
-                playctrl_stream::zero_channel_stream_loop(
-                    &host, rtsp_port, &cid, &user, &password,
-                    &verification_code,
-                    tx, stop, repaint_ctx,
-                );
-            });
-            state.stream_handle = Some(handle);
-        } else if use_snapshot {
-            log::info!("Starting snapshot stream for channel {}: {}", channel_id, channel_name);
-            let cid = channel_id.clone();
-            let handle = thread::spawn(move || {
-                snapshot_stream::snapshot_stream_loop(
-                    &cid, &host, port, &user, &password, tx, stop, repaint_ctx, interval,
-                );
-            });
-            state.stream_handle = Some(handle);
-        } else if use_hcnetsdk {
-            log::info!("Starting HCNetSDK stream for channel {}: {}", channel_id, channel_name);
-            let cid = channel_id.clone();
-            let vc = verification_code.clone();
-            let lp = if library_path.is_empty() {
-                None
-            } else {
-                Some(library_path)
-            };
-            let handle = thread::spawn(move || {
-                hcnetsdk_stream::hcnetsdk_stream_loop(
-                    &host, port, &user, &password, &cid,
-                    &vc, lp.as_deref(),
-                    tx, stop, repaint_ctx,
-                );
-            });
-            state.stream_handle = Some(handle);
-        } else if use_hcnetsdk {
-            log::info!("Starting HCNetSDK stream for channel {}: {}", channel_id, channel_name);
-            let cid = channel_id.clone();
-            let vc = verification_code.clone();
-            let lp = if library_path.is_empty() {
-                None
-            } else {
-                Some(library_path)
-            };
-            let handle = thread::spawn(move || {
-                hcnetsdk_stream::hcnetsdk_stream_loop(
-                    &host, port, &user, &password, &cid,
-                    &vc, lp.as_deref(),
-                    tx, stop, repaint_ctx,
-                );
-            });
-            state.stream_handle = Some(handle);
-        } else if use_playctrl {
-            log::info!("Starting PlayCtrl stream for channel {}: {}", channel_id, channel_name);
-            let lp = if library_path.is_empty() {
-                None
-            } else {
-                Some(library_path)
-            };
-            let cid = channel_id.clone();
-            let handle = thread::spawn(move || {
-                playctrl_stream::stream_loop(
-                    &host, rtsp_port, &cid, &user, &password,
-                    &verification_code, lp.as_deref(),
-                    tx, stop, repaint_ctx,
-                );
-            });
-            state.stream_handle = Some(handle);
-        } else {
-            log::info!("Starting RTSP stream for channel {}: {}", channel_id, channel_name);
-            let handle = thread::spawn(move || {
-                rtsp::stream_loop(&url, tx, stop, repaint_ctx);
-            });
-            state.stream_handle = Some(handle);
+            StreamMethod::Snapshot => {
+                log::info!("Starting snapshot stream for channel {}: {}", channel_id, channel_name);
+                let cid = channel_id.clone();
+                let handle = thread::spawn(move || {
+                    snapshot_stream::snapshot_stream_loop(
+                        &cid, &host, port, &user, &password, tx, stop, repaint_ctx, interval,
+                    );
+                });
+                state.stream_handle = Some(handle);
+            }
+            StreamMethod::HCNetSDK => {
+                let sdk_channel = (channel_index + 1) as i32;
+                log::info!("Starting HCNetSDK stream for channel {} (sdk_channel={}): {}", channel_id, sdk_channel, channel_name);
+                let cid = channel_id.clone();
+                let vc = verification_code.clone();
+                let lp = if library_path.is_empty() {
+                    None
+                } else {
+                    Some(library_path)
+                };
+                let handle = thread::spawn(move || {
+                    hcnetsdk_stream::hcnetsdk_stream_loop(
+                        &host, sdk_port, &user, &password, &cid, sdk_channel,
+                        &vc, lp.as_deref(),
+                        tx, stop, repaint_ctx,
+                    );
+                });
+                state.stream_handle = Some(handle);
+            }
+            StreamMethod::PlayCtrl => {
+                log::info!("Starting PlayCtrl stream for channel {}: {}", channel_id, channel_name);
+                let lp = if library_path.is_empty() {
+                    None
+                } else {
+                    Some(library_path)
+                };
+                let cid = channel_id.clone();
+                let handle = thread::spawn(move || {
+                    playctrl_stream::stream_loop(
+                        &host, rtsp_port, &cid, &user, &password,
+                        &verification_code, lp.as_deref(),
+                        tx, stop, repaint_ctx,
+                    );
+                });
+                state.stream_handle = Some(handle);
+            }
+            StreamMethod::Rtsp => {
+                log::info!("Starting RTSP stream for channel {}: {}", channel_id, channel_name);
+                let handle = thread::spawn(move || {
+                    rtsp::stream_loop(&url, tx, stop, repaint_ctx);
+                });
+                state.stream_handle = Some(handle);
+            }
         }
     }
 
@@ -603,55 +655,51 @@ impl HikvisionApp {
                         ui.label("RTSP Port:");
                         ui.add_sized([field_w, field_h], egui::TextEdit::singleline(&mut self.rtsp_port));
                         ui.end_row();
+                        if self.stream_method.show_sdk_port() {
+                            ui.label("SDK Port:");
+                            ui.add_sized([field_w, field_h], egui::TextEdit::singleline(&mut self.sdk_port).hint_text("8000"));
+                            ui.end_row();
+                        }
                         ui.label("Username:");
                         ui.add_sized([field_w, field_h], egui::TextEdit::singleline(&mut self.user));
                         ui.end_row();
                         ui.label("Password:");
                         ui.add_sized([field_w, field_h], egui::TextEdit::singleline(&mut self.password).password(true));
                         ui.end_row();
+                        ui.label("Método:");
+                        egui::ComboBox::from_id_salt("stream_method")
+                            .selected_text(self.stream_method.label())
+                            .width(field_w)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.stream_method, StreamMethod::Rtsp, StreamMethod::Rtsp.label());
+                                ui.selectable_value(&mut self.stream_method, StreamMethod::Snapshot, StreamMethod::Snapshot.label());
+                                ui.selectable_value(&mut self.stream_method, StreamMethod::PlayCtrl, StreamMethod::PlayCtrl.label());
+                                ui.selectable_value(&mut self.stream_method, StreamMethod::ZeroChannel, StreamMethod::ZeroChannel.label());
+                                ui.selectable_value(&mut self.stream_method, StreamMethod::HCNetSDK, StreamMethod::HCNetSDK.label());
+                            });
+                        ui.end_row();
                         ui.label("");
                         ui.checkbox(&mut self.use_substream, "Sub-stream (menor resolução, mais leve)");
                         ui.end_row();
-                        ui.label("");
-                        ui.checkbox(&mut self.use_snapshot, "Snapshot (JPEG polling, funciona com criptografia)");
-                        ui.end_row();
-                        if self.use_snapshot {
+                        if self.stream_method == StreamMethod::Snapshot {
                             ui.label("Intervalo (ms):");
                             ui.add(egui::Slider::new(&mut self.snapshot_interval, 100u64..=2000).suffix("ms"));
                             ui.end_row();
                         }
-                        ui.label("");
-                        ui.checkbox(&mut self.use_playctrl, "Usar PlayCtrl (descriptografia)");
-                        ui.end_row();
-                        ui.label("");
-                        ui.checkbox(&mut self.use_zero_channel, "Canal Zero (stream multiplexado)");
-                        ui.end_row();
-                        ui.label("");
-                        ui.checkbox(&mut self.use_hcnetsdk, "HCNetSDK (SDK oficial, descriptografia automática)");
-                        ui.end_row();
-                        if self.use_hcnetsdk {
-                            ui.label("");
-                            ui.label(egui::RichText::new("ℹ️ Usa libhcnetsdk.so para descriptografia nativa").small().color(egui::Color32::DARK_GRAY));
-                            ui.end_row();
-                        }
-                        if self.use_zero_channel {
-                            ui.label("");
-                            ui.label(egui::RichText::new("⚠️ Requer NVR/DVR com Canal Zero ativado nas configurações").small().color(egui::Color32::DARK_GRAY));
-                            ui.end_row();
-                        }
-                        if self.use_playctrl || self.use_zero_channel || self.use_hcnetsdk {
+                        if self.stream_method.needs_verification_code() {
                             ui.label("Verification Code:");
                             ui.add_sized([field_w, field_h], egui::TextEdit::singleline(&mut self.verification_code).password(true));
                             ui.end_row();
-                            if self.use_hcnetsdk {
-                                ui.label("SDK Path:");
-                                ui.add_sized([field_w, field_h], egui::TextEdit::singleline(&mut self.library_path).hint_text("libhcnetsdk.so (vazio=auto)"));
-                                ui.end_row();
+                        }
+                        if self.stream_method.needs_sdk_library() {
+                            let hint = if self.stream_method == StreamMethod::HCNetSDK {
+                                "libhcnetsdk.so (vazio=auto)"
                             } else {
-                                ui.label("Library Path:");
-                                ui.add_sized([field_w, field_h], egui::TextEdit::singleline(&mut self.library_path).hint_text("Deixe vazio para buscar automático"));
-                                ui.end_row();
-                            }
+                                "Deixe vazio para buscar automático"
+                            };
+                            ui.label("Library Path:");
+                            ui.add_sized([field_w, field_h], egui::TextEdit::singleline(&mut self.library_path).hint_text(hint));
+                            ui.end_row();
                         }
                     });
 
@@ -661,15 +709,14 @@ impl HikvisionApp {
                 }
 
                 ui.add_space(10.0);
-                if self.use_hcnetsdk {
-                    ui.label(egui::RichText::new("🔐 HCNetSDK (SDK oficial). Descriptografia automática via NET_DVR_SetSDKSecretKey. Requer libhcnetsdk.so.").small().color(egui::Color32::DARK_GREEN));
-                } else if self.use_playctrl {
-                    ui.label(egui::RichText::new("🔐 PlayCtrl com descriptografia. Requer libPlayCtrl.so e Verification Code do DVR.").small().color(egui::Color32::DARK_GREEN));
-                } else if self.use_snapshot {
-                    ui.label(egui::RichText::new("ℹ️ Snapshot JPEG polling. ~2-3 FPS. Não requer desativar criptografia.").small().color(egui::Color32::DARK_GRAY));
-                } else {
-                    ui.label(egui::RichText::new("⚠️ RTSP direto. Se a 'Criptografia de Transmissão' estiver ativada no DVR, o vídeo não carregará. Use HCNetSDK, PlayCtrl ou Snapshot.").small().color(egui::Color32::DARK_GRAY));
-                }
+                let status = match self.stream_method {
+                    StreamMethod::HCNetSDK => egui::RichText::new("🔐 HCNetSDK (SDK oficial). Descriptografia automática via NET_DVR_SetSDKSecretKey. Requer libhcnetsdk.so.").small().color(egui::Color32::DARK_GREEN),
+                    StreamMethod::PlayCtrl => egui::RichText::new("🔐 PlayCtrl com descriptografia. Requer libPlayCtrl.so e Verification Code do DVR.").small().color(egui::Color32::DARK_GREEN),
+                    StreamMethod::Snapshot => egui::RichText::new("ℹ️ Snapshot JPEG polling. ~2-3 FPS. Não requer desativar criptografia.").small().color(egui::Color32::DARK_GRAY),
+                    StreamMethod::ZeroChannel => egui::RichText::new("🔀 Canal Zero (RTSP multiplexado + descriptografia AES via FFmpeg). Requer Verification Code.").small().color(egui::Color32::DARK_BLUE),
+                    StreamMethod::Rtsp => egui::RichText::new("⚠️ RTSP direto. Se a 'Criptografia de Transmissão' estiver ativada no DVR, o vídeo não carregará.").small().color(egui::Color32::DARK_GRAY),
+                };
+                ui.label(status);
 
                 if let Some(ref err) = self.error {
                     ui.colored_label(egui::Color32::RED, err);
@@ -719,13 +766,14 @@ impl HikvisionApp {
             .default_width(200.0)
             .show(ctx, |ui| {
                 ui.heading("Channels");
-                if self.use_playctrl {
-                    ui.label(egui::RichText::new("🔐 PlayCtrl decrypt").small().color(egui::Color32::DARK_GREEN));
-                } else if self.use_snapshot {
-                    ui.label(egui::RichText::new("📷 Snapshot JPEG").small().color(egui::Color32::GREEN));
-                } else {
-                    ui.label(egui::RichText::new("🎥 RTSP stream").small().color(egui::Color32::LIGHT_BLUE));
-                }
+                let method_label = match self.stream_method {
+                    StreamMethod::HCNetSDK => egui::RichText::new("🔐 HCNetSDK").small().color(egui::Color32::DARK_GREEN),
+                    StreamMethod::PlayCtrl => egui::RichText::new("🔐 PlayCtrl").small().color(egui::Color32::DARK_GREEN),
+                    StreamMethod::Snapshot => egui::RichText::new("📷 Snapshot JPEG").small().color(egui::Color32::GREEN),
+                    StreamMethod::ZeroChannel => egui::RichText::new("🔀 Canal Zero").small().color(egui::Color32::DARK_BLUE),
+                    StreamMethod::Rtsp => egui::RichText::new("🎥 RTSP direto").small().color(egui::Color32::LIGHT_BLUE),
+                };
+                ui.label(method_label);
                 ui.separator();
 
                 egui::ComboBox::from_label("Layout")
@@ -839,13 +887,14 @@ impl HikvisionApp {
                 ui.add_space(100.0);
                 if self.streams[idx].stream_handle.is_some() {
                     ui.spinner();
-                    if self.use_playctrl {
-                        ui.label("PlayCtrl decrypting...");
-                    } else if self.use_snapshot {
-                        ui.label("Polling snapshot...");
-                    } else {
-                        ui.label("Connecting to RTSP stream...");
-                    }
+                    let loading_label = match self.stream_method {
+                        StreamMethod::HCNetSDK => "HCNetSDK connecting...",
+                        StreamMethod::PlayCtrl => "PlayCtrl decrypting...",
+                        StreamMethod::Snapshot => "Polling snapshot...",
+                        StreamMethod::ZeroChannel => "Canal Zero decrypting...",
+                        StreamMethod::Rtsp => "Connecting to RTSP stream...",
+                    };
+                    ui.label(loading_label);
                 } else {
                     ui.label("Select a channel to view");
                 }

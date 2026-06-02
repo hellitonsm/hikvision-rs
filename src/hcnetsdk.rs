@@ -6,6 +6,7 @@
 use anyhow::{Context, Result};
 use libloading::Library;
 use std::ffi::{c_char, c_int, c_void, CString};
+use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -19,6 +20,8 @@ type HWND = u32;
 pub const NAME_LEN: usize = 32;
 pub const SERIALNO_LEN: usize = 48;
 pub const NET_DVR_DEV_ADDRESS_MAX_LEN: usize = 129;
+pub const NET_DVR_LOGIN_USERNAME_MAX_LEN: usize = 64;
+pub const NET_DVR_LOGIN_PASSWD_MAX_LEN: usize = 64;
 
 // Stream types
 pub const STREAM_MAIN: DWORD = 0;
@@ -85,15 +88,18 @@ pub struct NET_DVR_USER_LOGIN_INFO {
     pub sDeviceAddress: [c_char; NET_DVR_DEV_ADDRESS_MAX_LEN],
     pub byUseTransport: u8,
     pub wPort: u16,
-    pub sUserName: [c_char; NAME_LEN],
-    pub sPassword: [c_char; NAME_LEN],
-    pub fLoginResultCallBack: *const c_void,
+    pub sUserName: [c_char; NET_DVR_LOGIN_USERNAME_MAX_LEN],
+    pub sPassword: [c_char; NET_DVR_LOGIN_PASSWD_MAX_LEN],
+    pub fLoginResultCallback: *const c_void, // fLoginResultCallBack
     pub pUser: *mut c_void,
-    pub byLoginMode: u8,
-    pub byHttps: u8,
-    pub iProxyID: c_int,
+    pub bUseAsynLogin: BOOL,  // 0 = synchronous login
+    pub byProxyType: u8,
     pub byUseUTCTime: u8,
-    pub byRes1: [u8; 119],
+    pub byLoginMode: u8,      // 0=Private, 1=ISAPI
+    pub byHttps: u8,          // 0=tcp, 1=tls
+    pub iProxyID: c_int,
+    pub byVerifyMode: u8,
+    pub byRes3: [u8; 119],
 }
 
 /// Preview information for NET_DVR_RealPlay_V40
@@ -134,13 +140,51 @@ pub fn default_search_paths() -> Vec<PathBuf> {
     let config_dir = PathBuf::from(&home).join(".config/hikvision-rs");
     let localcomponent = PathBuf::from(&home).join(".local/share/hikvision/weblocalserver/files/bin");
 
+    // Full SDK installation (has HCNetSDKCom/ alongside)
+    let sdk_home = PathBuf::from(&home)
+        .join("Documentos/hik/EN-HCNetSDKV6.1.9.4_build20220412_linux64")
+        .join("EN-HCNetSDKV6.1.9.4_build20220412_linux64/lib/libhcnetsdk.so");
+
     vec![
         cwd.join("hikvision-libs/libhcnetsdk.so"),
+        sdk_home,
         config_dir.join("libhcnetsdk.so"),
         localcomponent.join("libhcnetsdk.so"),
         PathBuf::from("/usr/local/lib/libhcnetsdk.so"),
         PathBuf::from("/usr/lib/libhcnetsdk.so"),
     ]
+}
+
+/// Procura pelo diretório HCNetSDKCom/ (componentes do SDK como libHCPreview.so)
+fn find_hcnetsdkcom_dir(lib_dir: &Path) -> Option<PathBuf> {
+    // 1. Ao lado da biblioteca carregada
+    let direct = lib_dir.join("HCNetSDKCom");
+    if direct.is_dir() {
+        return Some(direct);
+    }
+
+    // 2. Diretório pai (algumas instalações colocam um nível acima)
+    if let Some(parent) = lib_dir.parent() {
+        let parent_com = parent.join("HCNetSDKCom");
+        if parent_com.is_dir() {
+            return Some(parent_com);
+        }
+    }
+
+    // 3. Caminhos conhecidos da instalação do SDK
+    let home = std::env::var("HOME").ok()?;
+    let known = [
+        format!("{home}/Documentos/hik/EN-HCNetSDKV6.1.9.4_build20220412_linux64/EN-HCNetSDKV6.1.9.4_build20220412_linux64/lib/HCNetSDKCom"),
+        format!("{home}/Documentos/hik/EN-HCNetSDKV6.1.9.4_build20220412_linux64/EN-HCNetSDKV6.1.9.4_build20220412_linux64/QtDemo/Linux64/lib/HCNetSDKCom"),
+    ];
+    for p in &known {
+        let path = PathBuf::from(p);
+        if path.is_dir() {
+            return Some(path);
+        }
+    }
+
+    None
 }
 
 pub fn search_and_load() -> Result<HCNetSDK> {
@@ -177,6 +221,7 @@ pub struct HCNetSDK {
     _cleanup: unsafe extern "C" fn() -> BOOL,
     _login_v40: unsafe extern "C" fn(*mut NET_DVR_USER_LOGIN_INFO, *mut NET_DVR_DEVICEINFO_V40) -> LONG,
     _logout: unsafe extern "C" fn(LONG) -> BOOL,
+    _set_connect_time: unsafe extern "C" fn(DWORD, DWORD) -> BOOL,
     _set_sdk_secret_key: unsafe extern "C" fn(LONG, *const c_char) -> BOOL,
     _realplay_v40: unsafe extern "C" fn(LONG, *const NET_DVR_PREVIEWINFO, Option<REALDATACALLBACK>, *mut c_void) -> LONG,
     _stop_realplay: unsafe extern "C" fn(LONG) -> BOOL,
@@ -187,14 +232,40 @@ impl HCNetSDK {
     pub fn load_from(path: &Path) -> Result<Self> {
         let lib_dir = path.parent().unwrap_or(Path::new("."));
 
-        // Set LD_LIBRARY_PATH for bundled Qt5 deps
+        // Encontra HCNetSDKCom/ (componentes como libHCPreview.so que o SDK carrega)
+        let com_dir = find_hcnetsdkcom_dir(lib_dir);
+        let local_com = lib_dir.join("HCNetSDKCom");
+
+        // Se encontrar HCNetSDKCom em outro local, faz symlink para junto da lib
+        if let Some(ref com) = com_dir {
+            if !local_com.exists() {
+                log::info!("Symlinking HCNetSDKCom from {} to {}", com.display(), local_com.display());
+                if let Err(e) = unix_fs::symlink(com, &local_com) {
+                    log::warn!("Failed to symlink HCNetSDKCom: {}", e);
+                }
+            }
+        }
+
+        // Set LD_LIBRARY_PATH for bundled Qt5 deps and HCNetSDKCom components
+        if local_com.exists() {
+            log::info!("HCNetSDKCom available at {}", local_com.display());
+        } else {
+            log::warn!("HCNetSDKCom/ not found — SDK may fail with error 107 (NET_DVR_LOAD_HCPREVIEW_SDK_ERROR). \
+                        Copy HCNetSDKCom/ next to libhcnetsdk.so or use the SDK installation directly.");
+        }
+
         unsafe {
             let current = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
             let dir_str = lib_dir.to_string_lossy().to_string();
+            let mut paths = vec![dir_str];
+            if local_com.exists() {
+                paths.push(local_com.to_string_lossy().to_string());
+            }
+            let new_path = paths.join(":");
             if !current.is_empty() {
-                std::env::set_var("LD_LIBRARY_PATH", format!("{}:{}", dir_str, current));
+                std::env::set_var("LD_LIBRARY_PATH", format!("{}:{}", new_path, current));
             } else {
-                std::env::set_var("LD_LIBRARY_PATH", &dir_str);
+                std::env::set_var("LD_LIBRARY_PATH", &new_path);
             }
         }
 
@@ -205,6 +276,7 @@ impl HCNetSDK {
         let cleanup = *get_fn!(_lib, b"NET_DVR_Cleanup", unsafe extern "C" fn() -> BOOL);
         let login_v40 = *get_fn!(_lib, b"NET_DVR_Login_V40", unsafe extern "C" fn(*mut NET_DVR_USER_LOGIN_INFO, *mut NET_DVR_DEVICEINFO_V40) -> LONG);
         let logout = *get_fn!(_lib, b"NET_DVR_Logout", unsafe extern "C" fn(LONG) -> BOOL);
+        let set_connect_time = *get_fn!(_lib, b"NET_DVR_SetConnectTime", unsafe extern "C" fn(DWORD, DWORD) -> BOOL);
         let set_sdk_secret_key = *get_fn!(_lib, b"NET_DVR_SetSDKSecretKey", unsafe extern "C" fn(LONG, *const c_char) -> BOOL);
         let realplay_v40 = *get_fn!(_lib, b"NET_DVR_RealPlay_V40", unsafe extern "C" fn(LONG, *const NET_DVR_PREVIEWINFO, Option<REALDATACALLBACK>, *mut c_void) -> LONG);
         let stop_realplay = *get_fn!(_lib, b"NET_DVR_StopRealPlay", unsafe extern "C" fn(LONG) -> BOOL);
@@ -218,6 +290,7 @@ impl HCNetSDK {
             _cleanup: cleanup,
             _login_v40: login_v40,
             _logout: logout,
+            _set_connect_time: set_connect_time,
             _set_sdk_secret_key: set_sdk_secret_key,
             _realplay_v40: realplay_v40,
             _stop_realplay: stop_realplay,
@@ -237,6 +310,20 @@ impl HCNetSDK {
         }
     }
 
+    /// Set connection timeout and retry count
+    ///
+    /// Qt demo reference: NET_DVR_SetConnectTime(10000, 1) — 10s timeout, 1 retry
+    pub fn set_connect_time(&self, wait_ms: u32, retries: u32) -> Result<()> {
+        let ret = unsafe { (self._set_connect_time)(wait_ms, retries) };
+        if ret != 0 {
+            log::info!("NET_DVR_SetConnectTime({}, {}) succeeded", wait_ms, retries);
+            Ok(())
+        } else {
+            let err = self.get_last_error();
+            anyhow::bail!("NET_DVR_SetConnectTime failed (error {})", err);
+        }
+    }
+
     /// Cleanup SDK resources
     pub fn cleanup(&self) {
         unsafe { (self._cleanup)() };
@@ -253,26 +340,36 @@ impl HCNetSDK {
         login_info.sDeviceAddress[..bytes.len().min(NET_DVR_DEV_ADDRESS_MAX_LEN)]
             .copy_from_slice(unsafe { &*(bytes as *const [u8] as *const [i8]) });
 
-        // Copy username
+        // Copy username (max NET_DVR_LOGIN_USERNAME_MAX_LEN = 64)
         let user = CString::new(username).context("username contains null byte")?;
         let bytes = user.as_bytes_with_nul();
-        login_info.sUserName[..bytes.len().min(NAME_LEN)]
+        login_info.sUserName[..bytes.len().min(NET_DVR_LOGIN_USERNAME_MAX_LEN)]
             .copy_from_slice(unsafe { &*(bytes as *const [u8] as *const [i8]) });
 
-        // Copy password
+        // Copy password (max NET_DVR_LOGIN_PASSWD_MAX_LEN = 64)
         let pass = CString::new(password).context("password contains null byte")?;
         let bytes = pass.as_bytes_with_nul();
-        login_info.sPassword[..bytes.len().min(NAME_LEN)]
+        login_info.sPassword[..bytes.len().min(NET_DVR_LOGIN_PASSWD_MAX_LEN)]
             .copy_from_slice(unsafe { &*(bytes as *const [u8] as *const [i8]) });
 
         login_info.wPort = port;
-        login_info.byLoginMode = 0; // Private protocol
+        login_info.bUseAsynLogin = 0;     // FALSE = synchronous
+        login_info.byProxyType = 0;
+        login_info.byUseUTCTime = 0;
+        login_info.byLoginMode = 0;       // 0=Private
+        login_info.byHttps = 0;           // 0=tcp
+        login_info.iProxyID = 0;
+        login_info.byVerifyMode = 0;
+
+        log::info!("Calling NET_DVR_Login_V40: host={}, port={}, user={}, pass_len={}",
+            host, port, username, password.len());
 
         let user_id = unsafe { (self._login_v40)(&mut login_info, &mut device_info) };
 
         if user_id < 0 {
             let err = self.get_last_error();
-            anyhow::bail!("NET_DVR_Login_V40 failed (error {})", err);
+            log::error!("NET_DVR_Login_V40 failed with error code: {}", err);
+            anyhow::bail!("NET_DVR_Login_V40 failed (error {}). Check credentials and SDK version.", err);
         }
 
         log::info!("Login succeeded, user_id={}", user_id);
@@ -299,7 +396,7 @@ impl HCNetSDK {
 
         preview_info.lChannel = channel;
         preview_info.dwStreamType = stream_type;
-        preview_info.dwLinkMode = LINK_RTSP;
+        preview_info.dwLinkMode = LINK_TCP;
         preview_info.hPlayWnd = 0; // No window, use callback
         preview_info.bBlocked = 1;
 

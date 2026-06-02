@@ -1,8 +1,30 @@
 use anyhow::{Context, Result};
 use libloading::Library;
-use std::ffi::{c_char, c_int, CString};
+use std::ffi::{c_char, c_int, c_void, CString};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+
+#[repr(C)]
+pub struct FrameInfo {
+    pub n_width: c_int,
+    pub n_height: c_int,
+    pub n_stamp: c_int,
+    pub n_type: c_int,
+    pub n_frame_rate: c_int,
+    pub dw_frame_num: u32,
+}
+
+pub type DecCallBack = unsafe extern "C" fn(
+    n_port: c_int,
+    p_buf: *mut c_char,
+    n_size: c_int,
+    p_frame_info: *mut FrameInfo,
+    n_user: *mut c_void,
+    n_reserved2: c_int,
+);
+
+pub const T_YV12: c_int = 3;
+pub const T_RGB32: c_int = 7;
 
 macro_rules! get_fn {
     ($lib:expr, $name:literal, $sig:ty) => {
@@ -110,7 +132,7 @@ impl PlayCtrl {
             *self.port.lock().unwrap() = Some(port);
             Ok(port)
         } else {
-            let err = self.get_last_error();
+            let err = self.get_last_error(0);
             anyhow::bail!("PlayM4_GetPort failed (ret={}, error={})", ret, err);
         }
     }
@@ -127,28 +149,115 @@ impl PlayCtrl {
             *self.port.lock().unwrap() = None;
             Ok(())
         } else {
-            anyhow::bail!("PlayM4_FreePort failed (error {})", self.get_last_error());
+            anyhow::bail!("PlayM4_FreePort failed (error {})", self.get_last_error(port));
         }
+    }
+
+    pub fn set_stream_open_mode(&self, port: c_int, mode: u32) -> Result<()> {
+        let func = get_fn!(self._lib, b"PlayM4_SetStreamOpenMode", unsafe extern "C" fn(c_int, u32) -> c_int);
+        let ret = unsafe { func(port, mode) };
+        if Self::success(ret) { Ok(()) }
+        else { anyhow::bail!("PlayM4_SetStreamOpenMode failed (error {})", self.get_last_error(port)) }
+    }
+
+    pub fn get_picture_size(&self, port: c_int) -> Result<(c_int, c_int)> {
+        let func = get_fn!(self._lib, b"PlayM4_GetPictureSize", unsafe extern "C" fn(c_int, *mut c_int, *mut c_int) -> c_int);
+        let mut w: c_int = 0;
+        let mut h: c_int = 0;
+        let ret = unsafe { func(port, &mut w, &mut h) };
+        if Self::success(ret) && w > 0 && h > 0 {
+            Ok((w, h))
+        } else {
+            anyhow::bail!("PlayM4_GetPictureSize failed (error {})", self.get_last_error(port));
+        }
+    }
+
+    pub fn get_played_frames(&self, port: c_int) -> u32 {
+        let func = match unsafe { self._lib.get::<unsafe extern "C" fn(c_int) -> u32>(b"PlayM4_GetPlayedFrames") } {
+            Ok(f) => f,
+            Err(_) => return 0,
+        };
+        unsafe { func(port) }
+    }
+
+    pub fn set_decode_frame_type(&self, port: c_int, frame_type: u32) -> Result<()> {
+        let func = get_fn!(self._lib, b"PlayM4_SetDecodeFrameType", unsafe extern "C" fn(c_int, u32) -> c_int);
+        let ret = unsafe { func(port, frame_type) };
+        if Self::success(ret) { Ok(()) }
+        else { anyhow::bail!("PlayM4_SetDecodeFrameType failed (error {})", self.get_last_error(port)) }
+    }
+
+    pub fn set_dec_callback_mend(&self, port: c_int, callback: DecCallBack, user_data: *mut c_void) -> Result<()> {
+        let func = get_fn!(self._lib, b"PlayM4_SetDecCallBackMend", unsafe extern "C" fn(c_int, DecCallBack, *mut c_void) -> c_int);
+        let ret = unsafe { func(port, callback, user_data) };
+        if Self::success(ret) { Ok(()) }
+        else { anyhow::bail!("PlayM4_SetDecCallBackMend failed (error {})", self.get_last_error(port)) }
+    }
+
+    pub fn set_dec_callback_ex_mend(
+        &self,
+        port: c_int,
+        callback: DecCallBack,
+        dest_buf: *mut c_char,
+        dest_size: c_int,
+        user_data: *mut c_void,
+    ) -> Result<()> {
+        let func = get_fn!(self._lib, b"PlayM4_SetDecCallBackExMend", unsafe extern "C" fn(c_int, DecCallBack, *mut c_char, c_int, *mut c_void) -> c_int);
+        let ret = unsafe { func(port, callback, dest_buf, dest_size, user_data) };
+        if Self::success(ret) { Ok(()) }
+        else { anyhow::bail!("PlayM4_SetDecCallBackExMend failed (error {})", self.get_last_error(port)) }
+    }
+
+    pub fn refresh_play(&self, port: c_int) -> Result<()> {
+        let func = get_fn!(self._lib, b"PlayM4_RefreshPlay", unsafe extern "C" fn(c_int) -> c_int);
+        let ret = unsafe { func(port) };
+        if Self::success(ret) { Ok(()) }
+        else { anyhow::bail!("PlayM4_RefreshPlay failed (error {})", self.get_last_error(port)) }
+    }
+
+    pub fn get_total_frames(&self, port: c_int) -> u32 {
+        let func = match unsafe { self._lib.get::<unsafe extern "C" fn(c_int) -> u32>(b"PlayM4_GetFileTotalFrames") } {
+            Ok(f) => f,
+            Err(_) => return 0,
+        };
+        unsafe { func(port) }
+    }
+
+    pub fn get_source_buffer_remain(&self, port: c_int) -> u32 {
+        let func = match unsafe { self._lib.get::<unsafe extern "C" fn(c_int) -> u32>(b"PlayM4_GetSourceBufferRemain") } {
+            Ok(f) => f,
+            Err(_) => return 0,
+        };
+        unsafe { func(port) }
     }
 
     pub fn set_secret_key(&self, port: c_int, key: &str) -> Result<()> {
-        let func = get_fn!(self._lib, b"PlayM4_SetSecretKey", unsafe extern "C" fn(c_int, *const c_char, c_int) -> c_int);
+        let func = get_fn!(self._lib, b"PlayM4_SetSecretKey", unsafe extern "C" fn(c_int, c_int, *const c_char, c_int) -> c_int);
         let c_key = CString::new(key).context("key contains null byte")?;
-        let ret = unsafe { func(port, c_key.as_ptr(), key.len() as c_int) };
+        let ret = unsafe { func(port, 0, c_key.as_ptr(), key.len() as c_int) };
         if Self::success(ret) {
             Ok(())
         } else {
-            anyhow::bail!("PlayM4_SetSecretKey failed (error {})", self.get_last_error());
+            anyhow::bail!("PlayM4_SetSecretKey failed (error {})", self.get_last_error(port));
         }
     }
 
-    pub fn open_stream(&self, port: c_int, buf_size: c_int) -> Result<()> {
-        let func = get_fn!(self._lib, b"PlayM4_OpenStream", unsafe extern "C" fn(c_int, *const u8, c_int, c_int) -> c_int);
-        let ret = unsafe { func(port, std::ptr::null(), 0, buf_size) };
+    pub fn open_stream(&self, port: c_int, buf_size: u32) -> Result<()> {
+        self.open_stream_with_header(port, &[], buf_size)
+    }
+
+    pub fn open_stream_with_header(&self, port: c_int, header: &[u8], buf_size: u32) -> Result<()> {
+        let func = get_fn!(self._lib, b"PlayM4_OpenStream", unsafe extern "C" fn(c_int, *const u8, u32, u32) -> c_int);
+        let (ptr, len) = if header.is_empty() {
+            (std::ptr::null(), 0u32)
+        } else {
+            (header.as_ptr(), header.len() as u32)
+        };
+        let ret = unsafe { func(port, ptr, len, buf_size) };
         if Self::success(ret) {
             Ok(())
         } else {
-            anyhow::bail!("PlayM4_OpenStream failed (error {})", self.get_last_error());
+            anyhow::bail!("PlayM4_OpenStream failed (error {})", self.get_last_error(port));
         }
     }
 
@@ -158,58 +267,75 @@ impl PlayCtrl {
         if Self::success(ret) {
             Ok(())
         } else {
-            anyhow::bail!("PlayM4_CloseStream failed (error {})", self.get_last_error());
+            anyhow::bail!("PlayM4_CloseStream failed (error {})", self.get_last_error(port));
         }
     }
 
     pub fn input_data(&self, port: c_int, data: &[u8]) -> Result<()> {
-        let func = get_fn!(self._lib, b"PlayM4_InputData", unsafe extern "C" fn(c_int, *const u8, c_int) -> c_int);
-        let ret = unsafe { func(port, data.as_ptr(), data.len() as c_int) };
+        let func = get_fn!(self._lib, b"PlayM4_InputData", unsafe extern "C" fn(c_int, *const u8, u32) -> c_int);
+        let ret = unsafe { func(port, data.as_ptr(), data.len() as u32) };
         if Self::success(ret) {
             Ok(())
         } else {
-            let err = self.get_last_error();
-            Err(anyhow::anyhow!("PlayM4_InputData failed (error {})", err))
+            Err(anyhow::anyhow!("PlayM4_InputData failed (error {})", self.get_last_error(port)))
         }
     }
 
-    pub fn get_last_error(&self) -> c_int {
-        let func = match unsafe { self._lib.get::<unsafe extern "C" fn() -> c_int>(b"PlayM4_GetLastError") } {
+    pub fn get_last_error(&self, port: c_int) -> c_int {
+        let func = match unsafe { self._lib.get::<unsafe extern "C" fn(c_int) -> c_int>(b"PlayM4_GetLastError") } {
             Ok(f) => f,
             Err(_) => return -1,
         };
-        unsafe { func() }
+        unsafe { func(port) }
     }
 
     pub fn get_jpeg(&self, port: c_int) -> Result<Vec<u8>> {
-        let func = get_fn!(self._lib, b"PlayM4_GetJPEG", unsafe extern "C" fn(c_int, *mut u8, *mut c_int, *mut c_int, *mut c_int) -> c_int);
-        let mut size: c_int = 1024 * 1024;
-        let mut buf: Vec<u8> = vec![0u8; size as usize];
-        let mut width: c_int = 0;
-        let mut height: c_int = 0;
-        let ret = unsafe { func(port, buf.as_mut_ptr(), &mut size, &mut width, &mut height) };
+        let func = get_fn!(self._lib, b"PlayM4_GetJPEG", unsafe extern "C" fn(c_int, *mut u8, u32, *mut u32) -> c_int);
+        let buf_size: u32 = 1024 * 1024;
+        let mut buf: Vec<u8> = vec![0u8; buf_size as usize];
+        let mut jpeg_size: u32 = 0;
+        let ret = unsafe { func(port, buf.as_mut_ptr(), buf_size, &mut jpeg_size) };
         if Self::success(ret) {
-            buf.truncate(size as usize);
-            log::debug!("PlayM4_GetJPEG: {}x{} ({} bytes)", width, height, size);
+            buf.truncate(jpeg_size as usize);
+            log::debug!("PlayM4_GetJPEG: {} bytes", jpeg_size);
             Ok(buf)
         } else {
-            anyhow::bail!("PlayM4_GetJPEG failed (error {})", self.get_last_error());
+            anyhow::bail!("PlayM4_GetJPEG failed (error {})", self.get_last_error(port));
+        }
+    }
+
+    pub fn play(&self, port: c_int) -> Result<()> {
+        let func = get_fn!(self._lib, b"PlayM4_Play", unsafe extern "C" fn(c_int, u32) -> c_int);
+        let ret = unsafe { func(port, 0) };
+        if Self::success(ret) {
+            Ok(())
+        } else {
+            anyhow::bail!("PlayM4_Play failed (error {})", self.get_last_error(port));
+        }
+    }
+
+    pub fn stop(&self, port: c_int) -> Result<()> {
+        let func = get_fn!(self._lib, b"PlayM4_Stop", unsafe extern "C" fn(c_int) -> c_int);
+        let ret = unsafe { func(port) };
+        if Self::success(ret) {
+            Ok(())
+        } else {
+            anyhow::bail!("PlayM4_Stop failed (error {})", self.get_last_error(port));
         }
     }
 
     pub fn get_bmp(&self, port: c_int) -> Result<Vec<u8>> {
-        let func = get_fn!(self._lib, b"PlayM4_GetBMP", unsafe extern "C" fn(c_int, *mut u8, *mut c_int, *mut c_int, *mut c_int) -> c_int);
-        let mut size: c_int = 1024 * 1024 * 4;
-        let mut buf: Vec<u8> = vec![0u8; size as usize];
-        let mut width: c_int = 0;
-        let mut height: c_int = 0;
-        let ret = unsafe { func(port, buf.as_mut_ptr(), &mut size, &mut width, &mut height) };
+        let func = get_fn!(self._lib, b"PlayM4_GetBMP", unsafe extern "C" fn(c_int, *mut u8, u32, *mut u32) -> c_int);
+        let buf_size: u32 = 1024 * 1024 * 4;
+        let mut buf: Vec<u8> = vec![0u8; buf_size as usize];
+        let mut bmp_size: u32 = 0;
+        let ret = unsafe { func(port, buf.as_mut_ptr(), buf_size, &mut bmp_size) };
         if Self::success(ret) {
-            buf.truncate(size as usize);
-            log::debug!("PlayM4_GetBMP: {}x{} ({} bytes)", width, height, size);
+            buf.truncate(bmp_size as usize);
+            log::debug!("PlayM4_GetBMP: {} bytes", bmp_size);
             Ok(buf)
         } else {
-            anyhow::bail!("PlayM4_GetBMP failed (error {})", self.get_last_error());
+            anyhow::bail!("PlayM4_GetBMP failed (error {})", self.get_last_error(port));
         }
     }
 }

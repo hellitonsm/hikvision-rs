@@ -520,7 +520,7 @@ fn main() -> Result<()> {
                         Err(_) => {
                             // Expected when not enough data decoded yet
                             if frame_count > 50 && frame_count % 200 == 0 {
-                                let err_code = playctrl.get_last_error();
+                                let err_code = playctrl.get_last_error(port);
                                 log::warn!("No JPEG after {} frames (error {})", frame_count, err_code);
                             }
                         }

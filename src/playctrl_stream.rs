@@ -429,7 +429,7 @@ fn run_stream(
         log::warn!("Setting PlayM4_SetSecretKey (verification code '{}') on port {} (before OpenStream)", verification_code, port);
         match playctrl.set_secret_key(port, verification_code) {
             Ok(()) => log::info!("PlayM4_SetSecretKey OK"),
-            Err(e) => log::warn!("PlayM4_SetSecretKey failed: {} (error {})", e, playctrl.get_last_error()),
+            Err(e) => log::warn!("PlayM4_SetSecretKey failed: {} (error {})", e, playctrl.get_last_error(port)),
         }
     }
 
@@ -505,7 +505,7 @@ fn run_stream(
                 frame_count += 1;
                 byte_count += data_to_feed.len() as u64;
                 if let Err(e) = playctrl.input_data(port, &data_to_feed) {
-                    let err_code = playctrl.get_last_error();
+                    let err_code = playctrl.get_last_error(port);
                     if frame_count < 5 {
                         log::warn!("InputData error {}: {} (error {}: {})", frame_count, e, err_code,
                             crate::playctrl::last_error_name(err_code));
@@ -544,7 +544,7 @@ fn run_stream(
                         }
                         Ok(_) => {}
                         Err(e) => {
-                            let err_code = playctrl.get_last_error();
+                            let err_code = playctrl.get_last_error(port);
                             if frame_count > 50 && frame_count % 200 == 0 {
                                 log::warn!(
                                     "No JPEG after {} frames (error {}: {})",
