@@ -723,12 +723,10 @@ impl HikvisionApp {
 
     fn stop_all_streams(&mut self) {
         if self.stream_method == StreamMethod::HCNetSDK_X11 {
-            if let Some(ref mut multi) = self.hcnetsdk_x11_multi.take() {
-                multi.stop_all();
-            }
-            if let Some(ref mut mgr) = self.x11_manager {
-                mgr.clear();
-            }
+            // Stop all SDK streams (logout via Drop)
+            self.hcnetsdk_x11_multi = None;
+            // Destroy all X11 overlay windows completely
+            self.x11_manager = None;
             self.x11_pending.clear();
             return;
         }
@@ -957,12 +955,19 @@ impl HikvisionApp {
         if self.layout_mode != self.prev_layout {
             self.prev_layout = self.layout_mode;
 
-            // No modo X11 overlay, destruir todas as janelas overlay antes
-            // de recriar com as posições do novo layout
+            // No modo X11 overlay, destruir tudo e reconstruir limpo
             if self.stream_method.is_x11_overlay() {
-                if let Some(ref mut mgr) = self.x11_manager {
-                    mgr.clear();
+                self.hcnetsdk_x11_multi = None;
+                self.x11_manager = None;
+                self.x11_pending.clear();
+
+                // Recriar manager vazio
+                if self.x11_window_xid_obtained {
+                    self.x11_manager = Some(x11_embed::X11WindowManager::new());
                 }
+
+                // Re-marcar canais ativos como pendentes
+                // (streams foram parados pelo logout, mas UI ainda mostra checked)
             }
 
             for i in 0..self.streams.len() {
