@@ -686,6 +686,12 @@ impl HikvisionApp {
                 // Remove dos pendentes
                 self.x11_pending.retain(|&i| i != channel_index);
             }
+            // Limpar stream state para que start_stream() não bloqueie na guarda
+            if channel_index < self.streams.len() {
+                self.streams[channel_index].stream_handle = None;
+                self.streams[channel_index].frame_rx = None;
+                self.streams[channel_index].texture = None;
+            }
             return;
         }
 
@@ -728,6 +734,14 @@ impl HikvisionApp {
             // Destroy all X11 overlay windows completely
             self.x11_manager = None;
             self.x11_pending.clear();
+            // Limpar stream states para que start_stream() não bloqueie
+            for state in &mut self.streams {
+                state.stream_handle = None;
+                state.frame_rx = None;
+                state.texture = None;
+                state.frame_width = 0;
+                state.frame_height = 0;
+            }
             return;
         }
 
@@ -960,11 +974,21 @@ impl HikvisionApp {
                 let active_channels: Vec<usize> = (0..self.channels.len())
                     .filter(|&i| self.channel_is_active(i))
                     .collect();
+                log::info!("Layout change: {} active channels to re-start", active_channels.len());
 
                 // Destruir tudo e reconstruir limpo
                 self.hcnetsdk_x11_multi = None;
                 self.x11_manager = None;
                 self.x11_pending.clear();
+
+                // Limpar stream states para que start_stream() não bloqueie na guarda
+                for state in &mut self.streams {
+                    state.stream_handle = None;
+                    state.frame_rx = None;
+                    state.texture = None;
+                    state.frame_width = 0;
+                    state.frame_height = 0;
+                }
 
                 if self.x11_window_xid_obtained {
                     self.x11_manager = Some(x11_embed::X11WindowManager::new());
@@ -972,6 +996,7 @@ impl HikvisionApp {
 
                 // Re-iniciar canais que estavam ativos
                 for i in active_channels {
+                    log::info!("Layout change: re-starting channel index {}", i);
                     self.start_stream(i, ctx);
                 }
             } else {
