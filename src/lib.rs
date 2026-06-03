@@ -7,3 +7,4 @@ pub mod playctrl_stream;
 pub mod netstream;
 pub mod hcnetsdk;
 pub mod hcnetsdk_stream;
+pub mod x11_window;

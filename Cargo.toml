@@ -28,6 +28,7 @@ num-bigint = "0.4"
 rand = "0.8"
 libloading = "0.8"
 libc = "0.2"
+x11rb = "0.13"
 
 # Optimize dependencies even in debug mode (huge impact on decode speed)
 [profile.dev.package."*"]

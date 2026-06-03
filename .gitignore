@@ -24,5 +24,5 @@ config.json
 # Hikvision SDK libs
 hikvision-libs/
 
-#newqtDemo
-newqtdemo/
+#rustdemo
+rustdemo/

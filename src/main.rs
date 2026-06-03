@@ -1,4 +1,5 @@
 use hikvision_rs::api::{Channel, HikvisionAPI};
+use hikvision_rs::hcnetsdk;
 use hikvision_rs::playctrl_stream;
 use hikvision_rs::rtsp;
 use hikvision_rs::snapshot_stream;
@@ -293,6 +294,9 @@ struct HikvisionApp {
     prev_layout: LayoutMode,
     streams: Vec<StreamState>,
     focused_channel: Option<usize>,
+
+    /// HCNetSDK stream — must run on the main thread (matching rustdemo architecture).
+    hcnetsdk_stream: Option<hcnetsdk_stream::HCNetSDKStream>,
 }
 
 impl Default for HikvisionApp {
@@ -318,6 +322,7 @@ impl Default for HikvisionApp {
             prev_layout: LayoutMode::Single,
             streams: Vec::new(),
             focused_channel: None,
+            hcnetsdk_stream: None,
         }
     }
 }
@@ -532,23 +537,43 @@ impl HikvisionApp {
                 state.stream_handle = Some(handle);
             }
             StreamMethod::HCNetSDK => {
-                let sdk_channel = (channel_index + 1) as i32;
-                log::info!("Starting HCNetSDK stream for channel {} (sdk_channel={}): {}", channel_id, sdk_channel, channel_name);
-                let cid = channel_id.clone();
-                let vc = verification_code.clone();
-                let lp = if library_path.is_empty() {
+                // ISAPI channel IDs like "101" (ch1 main), "102" (ch1 sub), "201" (ch2 main)
+                // NET_DVR_RealPlay_V40 expects the physical channel number (1, 2, 3...)
+                let sdk_channel: i32 = channel_id.trim().parse::<i32>().unwrap_or(100) / 100;
+                log::info!("Starting HCNetSDK X11 stream for channel {} (sdk_channel={}): {}", channel_id, sdk_channel, channel_name);
+
+                // Must run login + RealPlay on main thread (matching rustdemo architecture)
+                // Stop any existing HCNetSDK stream first
+                if let Some(mut old) = self.hcnetsdk_stream.take() {
+                    let _ = old.stop();
+                }
+
+                let vc = if verification_code.is_empty() {
                     None
                 } else {
-                    Some(library_path)
+                    Some(verification_code.as_str())
                 };
-                let handle = thread::spawn(move || {
-                    hcnetsdk_stream::hcnetsdk_stream_loop(
-                        &host, sdk_port, &user, &password, &cid, sdk_channel,
-                        &vc, lp.as_deref(),
-                        tx, stop, repaint_ctx,
-                    );
-                });
-                state.stream_handle = Some(handle);
+                match hcnetsdk_stream::HCNetSDKStream::new(
+                    &host, sdk_port, &user, &password, vc,
+                ) {
+                    Ok(mut stream) => {
+                        match stream.start(sdk_channel, true) {
+                            Ok(()) => {
+                                log::info!("HCNetSDK X11 preview started on main thread");
+                                self.hcnetsdk_stream = Some(stream);
+                            }
+                            Err(e) => {
+                                log::error!("Failed to start HCNetSDK preview: {}", e);
+                                self.error = Some(e.to_string());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Failed to create HCNetSDK stream: {}", e);
+                        self.error = Some(e.to_string());
+                    }
+                }
+                state.frame_rx = None;
             }
             StreamMethod::PlayCtrl => {
                 log::info!("Starting PlayCtrl stream for channel {}: {}", channel_id, channel_name);
@@ -578,6 +603,14 @@ impl HikvisionApp {
     }
 
     fn stop_stream(&mut self, channel_index: usize) {
+        // HCNetSDK mode uses a main-thread stream, not per-channel threads
+        if self.stream_method == StreamMethod::HCNetSDK {
+            if let Some(mut stream) = self.hcnetsdk_stream.take() {
+                let _ = stream.stop();
+            }
+            return;
+        }
+
         if channel_index >= self.streams.len() {
             return;
         }
@@ -595,6 +628,12 @@ impl HikvisionApp {
     }
 
     fn stop_all_streams(&mut self) {
+        if self.stream_method == StreamMethod::HCNetSDK {
+            if let Some(mut stream) = self.hcnetsdk_stream.take() {
+                let _ = stream.stop();
+            }
+            return;
+        }
         for i in 0..self.streams.len() {
             self.stop_stream(i);
         }
@@ -888,7 +927,7 @@ impl HikvisionApp {
                 if self.streams[idx].stream_handle.is_some() {
                     ui.spinner();
                     let loading_label = match self.stream_method {
-                        StreamMethod::HCNetSDK => "HCNetSDK connecting...",
+                        StreamMethod::HCNetSDK => "HCNetSDK (janela X11 separada)",
                         StreamMethod::PlayCtrl => "PlayCtrl decrypting...",
                         StreamMethod::Snapshot => "Polling snapshot...",
                         StreamMethod::ZeroChannel => "Canal Zero decrypting...",
@@ -996,7 +1035,11 @@ impl HikvisionApp {
             ui.add_space(cell_size.y * 0.35);
             ui.colored_label(egui::Color32::GRAY, &channel_name);
             if state.stream_handle.is_some() {
-                ui.colored_label(egui::Color32::DARK_GRAY, "Aguardando...");
+                if self.stream_method == StreamMethod::HCNetSDK {
+                    ui.colored_label(egui::Color32::YELLOW, "Veja janela X11");
+                } else {
+                    ui.colored_label(egui::Color32::DARK_GRAY, "Aguardando...");
+                }
             } else {
                 ui.colored_label(egui::Color32::DARK_GRAY, "Sem Sinal");
             }
@@ -1007,6 +1050,14 @@ impl HikvisionApp {
 impl eframe::App for HikvisionApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.api.is_some() && !self.channels.is_empty() {
+            // Poll HCNetSDK X11 events (must be on main thread, like rustdemo)
+            if let Some(ref mut stream) = self.hcnetsdk_stream {
+                if !stream.poll_window_events() {
+                    log::info!("HCNetSDK preview window closed by user");
+                    let _ = stream.stop();
+                    self.hcnetsdk_stream = None;
+                }
+            }
             self.drain_frames(ctx);
             ctx.request_repaint();
             self.show_viewer(ctx);
@@ -1025,6 +1076,13 @@ fn main() {
 
     ffmpeg_next::init().expect("Failed to initialize FFmpeg");
     ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Warning);
+
+    // Initialize HCNetSDK on the main thread (required by the Hikvision SDK
+    // for X11/rendering resource initialization) before spawning any threads.
+    // This is idempotent only done once at startup.
+    if let Err(e) = hcnetsdk::ensure_initialized() {
+        log::warn!("HCNetSDK init failed (non-fatal for RTSP/Snapshot modes): {}", e);
+    }
 
     let config = Config::load();
     let mut app = HikvisionApp::default();

@@ -1670,6 +1670,7 @@ dependencies = [
  "tungstenite",
  "ureq",
  "uuid",
+ "x11rb",
 ]
 
 [[package]]
