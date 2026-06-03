@@ -1,10 +1,13 @@
 use hikvision_rs::api::{Channel, HikvisionAPI};
 use hikvision_rs::hcnetsdk;
+use hikvision_rs::hcnetsdk_x11_multi;
 use hikvision_rs::playctrl_stream;
 use hikvision_rs::rtsp;
 use hikvision_rs::snapshot_stream;
-use hikvision_rs::hcnetsdk_stream;
+use hikvision_rs::hcnetsdk_multi_stream;
+use hikvision_rs::x11_embed;
 use eframe::egui;
+use raw_window_handle::HasWindowHandle;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,6 +23,8 @@ enum StreamMethod {
     PlayCtrl,
     ZeroChannel,
     HCNetSDK,
+    #[allow(non_camel_case_types)]
+    HCNetSDK_X11,
 }
 
 impl StreamMethod {
@@ -29,20 +34,26 @@ impl StreamMethod {
             StreamMethod::Snapshot => "Snapshot (JPEG polling)",
             StreamMethod::PlayCtrl => "PlayCtrl (descriptografia)",
             StreamMethod::ZeroChannel => "Canal Zero (stream multiplexado)",
-            StreamMethod::HCNetSDK => "HCNetSDK (SDK oficial)",
+            StreamMethod::HCNetSDK => "HCNetSDK (callback + PlayM4)",
+            StreamMethod::HCNetSDK_X11 => "HCNetSDK X11 (overlay direto)",
         }
     }
 
     fn needs_verification_code(&self) -> bool {
-        matches!(self, StreamMethod::PlayCtrl | StreamMethod::ZeroChannel | StreamMethod::HCNetSDK)
+        matches!(self, StreamMethod::PlayCtrl | StreamMethod::ZeroChannel | StreamMethod::HCNetSDK | StreamMethod::HCNetSDK_X11)
     }
 
     fn needs_sdk_library(&self) -> bool {
-        matches!(self, StreamMethod::PlayCtrl | StreamMethod::HCNetSDK)
+        matches!(self, StreamMethod::PlayCtrl | StreamMethod::HCNetSDK | StreamMethod::HCNetSDK_X11)
     }
 
     fn show_sdk_port(&self) -> bool {
-        matches!(self, StreamMethod::HCNetSDK)
+        matches!(self, StreamMethod::HCNetSDK | StreamMethod::HCNetSDK_X11)
+    }
+
+    /// Retorna true se o método renderiza via overlay X11 direto (sem egui texture).
+    fn is_x11_overlay(&self) -> bool {
+        matches!(self, StreamMethod::HCNetSDK_X11)
     }
 }
 
@@ -295,8 +306,14 @@ struct HikvisionApp {
     streams: Vec<StreamState>,
     focused_channel: Option<usize>,
 
-    /// HCNetSDK stream — must run on the main thread (matching rustdemo architecture).
-    hcnetsdk_stream: Option<hcnetsdk_stream::HCNetSDKStream>,
+    hcnetsdk_multi: Option<hcnetsdk_multi_stream::HCNetSDKMultiStream>,
+    hcnetsdk_x11_multi: Option<hcnetsdk_x11_multi::HCNetSDKX11Multi>,
+    x11_manager: Option<x11_embed::X11WindowManager>,
+    x11_main_xid: Option<u32>,
+    x11_window_xid_obtained: bool,
+    /// Canais que precisam iniciar stream X11 mas a janela ainda não existia.
+    /// Resolvido em try_start_pending_x11_streams() após ensure_window.
+    x11_pending: Vec<usize>,
 }
 
 impl Default for HikvisionApp {
@@ -322,7 +339,12 @@ impl Default for HikvisionApp {
             prev_layout: LayoutMode::Single,
             streams: Vec::new(),
             focused_channel: None,
-            hcnetsdk_stream: None,
+            hcnetsdk_multi: None,
+            hcnetsdk_x11_multi: None,
+            x11_manager: None,
+            x11_main_xid: None,
+            x11_window_xid_obtained: false,
+            x11_pending: Vec::new(),
         }
     }
 }
@@ -474,7 +496,7 @@ impl HikvisionApp {
         if channel_index >= self.channels.len() {
             return;
         }
-        if self.streams[channel_index].stream_handle.is_some() {
+        if self.streams[channel_index].stream_handle.is_some() || self.streams[channel_index].frame_rx.is_some() {
             return;
         }
 
@@ -537,43 +559,90 @@ impl HikvisionApp {
                 state.stream_handle = Some(handle);
             }
             StreamMethod::HCNetSDK => {
-                // ISAPI channel IDs like "101" (ch1 main), "102" (ch1 sub), "201" (ch2 main)
-                // NET_DVR_RealPlay_V40 expects the physical channel number (1, 2, 3...)
                 let sdk_channel: i32 = channel_id.trim().parse::<i32>().unwrap_or(100) / 100;
-                log::info!("Starting HCNetSDK X11 stream for channel {} (sdk_channel={}): {}", channel_id, sdk_channel, channel_name);
-
-                // Must run login + RealPlay on main thread (matching rustdemo architecture)
-                // Stop any existing HCNetSDK stream first
-                if let Some(mut old) = self.hcnetsdk_stream.take() {
-                    let _ = old.stop();
-                }
+                log::info!("Starting HCNetSDK callback stream ch {} (sdk={})", channel_id, sdk_channel);
 
                 let vc = if verification_code.is_empty() {
                     None
                 } else {
                     Some(verification_code.as_str())
                 };
-                match hcnetsdk_stream::HCNetSDKStream::new(
-                    &host, sdk_port, &user, &password, vc,
-                ) {
-                    Ok(mut stream) => {
-                        match stream.start(sdk_channel, true) {
-                            Ok(()) => {
-                                log::info!("HCNetSDK X11 preview started on main thread");
-                                self.hcnetsdk_stream = Some(stream);
-                            }
-                            Err(e) => {
-                                log::error!("Failed to start HCNetSDK preview: {}", e);
-                                self.error = Some(e.to_string());
-                            }
+
+                if self.hcnetsdk_multi.is_none() {
+                    let lp = if library_path.is_empty() {
+                        None
+                    } else {
+                        Some(library_path.as_str())
+                    };
+                    match hcnetsdk_multi_stream::HCNetSDKMultiStream::new(
+                        &host, sdk_port, &user, &password, vc, lp,
+                    ) {
+                        Ok(ms) => {
+                            self.hcnetsdk_multi = Some(ms);
+                        }
+                        Err(e) => {
+                            log::error!("Failed to create HCNetSDK multi-stream: {}", e);
+                            self.error = Some(e.to_string());
+                            return;
                         }
                     }
+                }
+
+                let multi = self.hcnetsdk_multi.as_mut().unwrap();
+                match multi.start_channel(sdk_channel, !force_sub) {
+                    Ok(rx) => {
+                        state.frame_rx = Some(rx);
+                        log::info!("HCNetSDK callback ch {} started", sdk_channel);
+                    }
                     Err(e) => {
-                        log::error!("Failed to create HCNetSDK stream: {}", e);
+                        log::error!("HCNetSDK start_channel {} failed: {}", sdk_channel, e);
                         self.error = Some(e.to_string());
                     }
                 }
-                state.frame_rx = None;
+            }
+            StreamMethod::HCNetSDK_X11 => {
+                let sdk_channel: i32 = channel_id.trim().parse::<i32>().unwrap_or(100) / 100;
+                log::info!("Starting HCNetSDK X11 direct stream ch {} (sdk={})", channel_id, sdk_channel);
+
+                // Garantir login do SDK
+                if self.x11_main_xid.is_some() {
+                    let vc = if verification_code.is_empty() {
+                        None
+                    } else {
+                        Some(verification_code.as_str())
+                    };
+
+                    if self.hcnetsdk_x11_multi.is_none() {
+                        match hcnetsdk_x11_multi::HCNetSDKX11Multi::new(
+                            &host, sdk_port, &user, &password, vc,
+                        ) {
+                            Ok(ms) => {
+                                self.hcnetsdk_x11_multi = Some(ms);
+                            }
+                            Err(e) => {
+                                log::error!("Failed to create HCNetSDK X11 multi: {}", e);
+                                self.error = Some(e.to_string());
+                                return;
+                            }
+                        }
+                    }
+
+                    // A janela X11 é criada por ensure_window() durante a renderização.
+                    // Marcamos este canal como pendente — try_start_pending_x11_streams()
+                    // o iniciará após a janela existir.
+                    if !self.x11_pending.contains(&channel_index) {
+                        self.x11_pending.push(channel_index);
+                        log::info!("Channel index {} marked as X11 pending (window not yet created)", channel_index);
+                    }
+
+                    // Tenta iniciar imediatamente se a janela já existe
+                    self.try_start_pending_x11_streams();
+                } else {
+                    log::warn!("X11 main window XID not available yet, deferring X11 stream start");
+                    if !self.x11_pending.contains(&channel_index) {
+                        self.x11_pending.push(channel_index);
+                    }
+                }
             }
             StreamMethod::PlayCtrl => {
                 log::info!("Starting PlayCtrl stream for channel {}: {}", channel_id, channel_name);
@@ -603,10 +672,35 @@ impl HikvisionApp {
     }
 
     fn stop_stream(&mut self, channel_index: usize) {
-        // HCNetSDK mode uses a main-thread stream, not per-channel threads
+        if self.stream_method == StreamMethod::HCNetSDK_X11 {
+            if channel_index < self.channels.len() {
+                let channel_id = &self.channels[channel_index].id;
+                let sdk_channel: i32 = channel_id.trim().parse::<i32>().unwrap_or(100) / 100;
+                if let Some(ref mut multi) = self.hcnetsdk_x11_multi {
+                    multi.stop_channel(sdk_channel);
+                }
+                // Remove a janela X11 filha
+                if let Some(ref mut mgr) = self.x11_manager {
+                    mgr.remove_window(channel_index);
+                }
+                // Remove dos pendentes
+                self.x11_pending.retain(|&i| i != channel_index);
+            }
+            return;
+        }
+
         if self.stream_method == StreamMethod::HCNetSDK {
-            if let Some(mut stream) = self.hcnetsdk_stream.take() {
-                let _ = stream.stop();
+            if channel_index < self.channels.len() {
+                let channel_id = &self.channels[channel_index].id;
+                let sdk_channel: i32 = channel_id.trim().parse::<i32>().unwrap_or(100) / 100;
+                if let Some(ref mut multi) = self.hcnetsdk_multi {
+                    multi.stop_channel(sdk_channel);
+                }
+                let state = &mut self.streams[channel_index];
+                state.frame_rx = None;
+                state.texture = None;
+                state.frame_width = 0;
+                state.frame_height = 0;
             }
             return;
         }
@@ -628,9 +722,28 @@ impl HikvisionApp {
     }
 
     fn stop_all_streams(&mut self) {
+        if self.stream_method == StreamMethod::HCNetSDK_X11 {
+            if let Some(ref mut multi) = self.hcnetsdk_x11_multi.take() {
+                multi.stop_all();
+            }
+            if let Some(ref mut mgr) = self.x11_manager {
+                mgr.clear();
+            }
+            self.x11_pending.clear();
+            return;
+        }
+
         if self.stream_method == StreamMethod::HCNetSDK {
-            if let Some(mut stream) = self.hcnetsdk_stream.take() {
-                let _ = stream.stop();
+            if let Some(ref mut multi) = self.hcnetsdk_multi.take() {
+                multi.stop_all();
+            }
+            for state in &mut self.streams {
+                state.frame_rx = None;
+                state.texture = None;
+                state.stream_stop = None;
+                state.stream_handle = None;
+                state.frame_width = 0;
+                state.frame_height = 0;
             }
             return;
         }
@@ -639,7 +752,81 @@ impl HikvisionApp {
         }
     }
 
+    /// Tenta iniciar streams X11 pendentes cujas janelas já foram criadas.
+    /// Chamado a cada frame após ensure_window() na renderização.
+    fn try_start_pending_x11_streams(&mut self) {
+        if self.x11_pending.is_empty() {
+            return;
+        }
+        if self.hcnetsdk_x11_multi.is_none() {
+            return;
+        }
+
+        let mut still_pending = Vec::new();
+        for &idx in &self.x11_pending {
+            if idx >= self.channels.len() {
+                continue;
+            }
+            let channel_id = &self.channels[idx].id;
+            let sdk_channel: i32 = channel_id.trim().parse::<i32>().unwrap_or(100) / 100;
+
+            // Já está ativo? Remove dos pendentes.
+            if self.hcnetsdk_x11_multi.as_ref().map(|m| m.is_channel_active(sdk_channel)).unwrap_or(false) {
+                log::info!("X11 pending: channel {} already active, removing from pending", sdk_channel);
+                continue;
+            }
+
+            // Verifica se a janela X11 existe
+            let win_id = self.x11_manager.as_ref().and_then(|mgr| mgr.window_id(idx));
+            match win_id {
+                Some(win_id) => {
+                    let force_sub = matches!(
+                        self.layout_mode,
+                        LayoutMode::Grid2x2 | LayoutMode::Grid3x3 | LayoutMode::Grid4x4
+                    );
+                    let multi = self.hcnetsdk_x11_multi.as_mut().unwrap();
+                    match multi.start_channel(sdk_channel, !force_sub, win_id) {
+                        Ok(()) => {
+                            log::info!("X11 pending: channel {} started on window 0x{:x}", sdk_channel, win_id);
+                        }
+                        Err(e) => {
+                            log::error!("X11 pending: start_channel {} failed: {}", sdk_channel, e);
+                            still_pending.push(idx);
+                        }
+                    }
+                }
+                None => {
+                    // Janela ainda não existe, manter pendente
+                    still_pending.push(idx);
+                }
+            }
+        }
+        self.x11_pending = still_pending;
+    }
+
+    fn channel_is_active(&self, idx: usize) -> bool {
+        if self.stream_method.is_x11_overlay() {
+            if idx >= self.channels.len() {
+                return false;
+            }
+            let channel_id = &self.channels[idx].id;
+            let sdk_channel: i32 = channel_id.trim().parse::<i32>().unwrap_or(100) / 100;
+            return self.hcnetsdk_x11_multi.as_ref()
+                .map(|m| m.is_channel_active(sdk_channel))
+                .unwrap_or(false)
+                || self.x11_pending.contains(&idx);
+        }
+        if idx >= self.streams.len() {
+            return false;
+        }
+        self.streams[idx].stream_handle.is_some() || self.streams[idx].frame_rx.is_some()
+    }
+
     fn drain_frames(&mut self, ctx: &egui::Context) {
+        // No modo X11 overlay, não há frames para drenar (o SDK renderiza direto)
+        if self.stream_method.is_x11_overlay() {
+            return;
+        }
         for (i, state) in self.streams.iter_mut().enumerate() {
             if let Some(rx) = &state.frame_rx {
                 while let Ok(frame) = rx.try_recv() {
@@ -715,6 +902,7 @@ impl HikvisionApp {
                                 ui.selectable_value(&mut self.stream_method, StreamMethod::PlayCtrl, StreamMethod::PlayCtrl.label());
                                 ui.selectable_value(&mut self.stream_method, StreamMethod::ZeroChannel, StreamMethod::ZeroChannel.label());
                                 ui.selectable_value(&mut self.stream_method, StreamMethod::HCNetSDK, StreamMethod::HCNetSDK.label());
+                                ui.selectable_value(&mut self.stream_method, StreamMethod::HCNetSDK_X11, StreamMethod::HCNetSDK_X11.label());
                             });
                         ui.end_row();
                         ui.label("");
@@ -731,7 +919,7 @@ impl HikvisionApp {
                             ui.end_row();
                         }
                         if self.stream_method.needs_sdk_library() {
-                            let hint = if self.stream_method == StreamMethod::HCNetSDK {
+                            let hint = if self.stream_method == StreamMethod::HCNetSDK || self.stream_method == StreamMethod::HCNetSDK_X11 {
                                 "libhcnetsdk.so (vazio=auto)"
                             } else {
                                 "Deixe vazio para buscar automático"
@@ -749,7 +937,8 @@ impl HikvisionApp {
 
                 ui.add_space(10.0);
                 let status = match self.stream_method {
-                    StreamMethod::HCNetSDK => egui::RichText::new("🔐 HCNetSDK (SDK oficial). Descriptografia automática via NET_DVR_SetSDKSecretKey. Requer libhcnetsdk.so.").small().color(egui::Color32::DARK_GREEN),
+                    StreamMethod::HCNetSDK => egui::RichText::new("🔐 HCNetSDK (callback + PlayM4). Descriptografia automática via NET_DVR_SetSDKSecretKey.").small().color(egui::Color32::DARK_GREEN),
+                    StreamMethod::HCNetSDK_X11 => egui::RichText::new("🖥️ HCNetSDK X11 (overlay direto). SDK renderiza via X11 — sem decodificação manual. Requer libhcnetsdk.so.").small().color(egui::Color32::DARK_GREEN),
                     StreamMethod::PlayCtrl => egui::RichText::new("🔐 PlayCtrl com descriptografia. Requer libPlayCtrl.so e Verification Code do DVR.").small().color(egui::Color32::DARK_GREEN),
                     StreamMethod::Snapshot => egui::RichText::new("ℹ️ Snapshot JPEG polling. ~2-3 FPS. Não requer desativar criptografia.").small().color(egui::Color32::DARK_GRAY),
                     StreamMethod::ZeroChannel => egui::RichText::new("🔀 Canal Zero (RTSP multiplexado + descriptografia AES via FFmpeg). Requer Verification Code.").small().color(egui::Color32::DARK_BLUE),
@@ -768,11 +957,17 @@ impl HikvisionApp {
         if self.layout_mode != self.prev_layout {
             self.prev_layout = self.layout_mode;
             for i in 0..self.streams.len() {
-                if self.streams[i].stream_handle.is_some() {
+                if self.channel_is_active(i) {
                     self.stop_stream(i);
                     self.start_stream(i, ctx);
                 }
             }
+        }
+
+        // Inicializar X11 overlay se necessário
+        if self.stream_method.is_x11_overlay() && self.x11_manager.is_none() && self.x11_window_xid_obtained {
+            log::info!("Initializing X11 overlay window manager");
+            self.x11_manager = Some(x11_embed::X11WindowManager::new());
         }
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
@@ -781,9 +976,9 @@ impl HikvisionApp {
                 if self.device_supports_zero_channel {
                     ui.label(egui::RichText::new("🔀 Canal Zero OK").small().color(egui::Color32::GREEN));
                 }
-                if self.streams.iter().any(|s| s.stream_handle.is_some()) {
+                if self.streams.iter().any(|s| s.stream_handle.is_some() || s.frame_rx.is_some()) {
                     ui.separator();
-                    let active = self.streams.iter().filter(|s| s.stream_handle.is_some()).count();
+                    let active = self.streams.iter().filter(|s| s.stream_handle.is_some() || s.frame_rx.is_some()).count();
                     let total = self.channels.len();
                     ui.label(format!("{}/{} streams", active, total));
                 }
@@ -807,6 +1002,7 @@ impl HikvisionApp {
                 ui.heading("Channels");
                 let method_label = match self.stream_method {
                     StreamMethod::HCNetSDK => egui::RichText::new("🔐 HCNetSDK").small().color(egui::Color32::DARK_GREEN),
+                    StreamMethod::HCNetSDK_X11 => egui::RichText::new("🖥️ HCNetSDK X11").small().color(egui::Color32::DARK_GREEN),
                     StreamMethod::PlayCtrl => egui::RichText::new("🔐 PlayCtrl").small().color(egui::Color32::DARK_GREEN),
                     StreamMethod::Snapshot => egui::RichText::new("📷 Snapshot JPEG").small().color(egui::Color32::GREEN),
                     StreamMethod::ZeroChannel => egui::RichText::new("🔀 Canal Zero").small().color(egui::Color32::DARK_BLUE),
@@ -844,7 +1040,7 @@ impl HikvisionApp {
                                 let label = format!("[{}] {}", ch.id, ch.name);
                                 if ui.selectable_label(selected, &label).clicked() {
                                     self.focused_channel = Some(i);
-                                    if self.streams[i].stream_handle.is_none() {
+                                    if !self.channel_is_active(i) {
                                         self.start_stream(i, ctx);
                                     }
                                 }
@@ -852,7 +1048,7 @@ impl HikvisionApp {
                         }
                         _ => {
                             for (i, ch) in channels.iter().enumerate() {
-                                let is_on = self.streams[i].stream_handle.is_some();
+                                let is_on = self.channel_is_active(i);
                                 let mut checked = is_on;
                                 let label = format!("[{}] {}", ch.id, ch.name);
                                 if ui.checkbox(&mut checked, &label).changed() {
@@ -867,7 +1063,7 @@ impl HikvisionApp {
                             if ui.button("Start All").clicked() {
                                 let cap = self.layout_mode.capacity();
                                 for i in 0..self.streams.len().min(cap) {
-                                    if self.streams[i].stream_handle.is_none() {
+                                    if !self.channel_is_active(i) {
                                         self.start_stream(i, ctx);
                                     }
                                 }
@@ -889,6 +1085,39 @@ impl HikvisionApp {
     }
 
     fn show_single_view(&mut self, ui: &mut egui::Ui) {
+        // Modo X11 overlay: sincronizar janela filha e mostrar label
+        if self.stream_method.is_x11_overlay() {
+            let idx = match self.focused_channel {
+                Some(i) if i < self.channels.len() => i,
+                _ => {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(100.0);
+                        ui.label("Select a channel to view");
+                    });
+                    return;
+                }
+            };
+
+            let rect = ui.max_rect();
+            if let Some(ref mut mgr) = self.x11_manager {
+                // No modo Single, esconder janelas de outros canais
+                mgr.hide_all_except(idx);
+                mgr.ensure_window(idx, rect.min.x, rect.min.y, rect.width(), rect.height());
+            }
+
+            ui.vertical_centered(|ui| {
+                let name = &self.channels[idx].name;
+                if self.channel_is_active(idx) {
+                    ui.colored_label(egui::Color32::DARK_GREEN, format!("● {} — Live (X11 overlay)", name));
+                } else {
+                    ui.add_space(100.0);
+                    ui.label(name);
+                    ui.colored_label(egui::Color32::DARK_GRAY, "X11 overlay — aguardando stream");
+                }
+            });
+            return;
+        }
+
         let idx = match self.focused_channel {
             Some(i) if i < self.streams.len() => i,
             _ => {
@@ -924,10 +1153,11 @@ impl HikvisionApp {
         } else {
             ui.vertical_centered(|ui| {
                 ui.add_space(100.0);
-                if self.streams[idx].stream_handle.is_some() {
+                if self.channel_is_active(idx) {
                     ui.spinner();
                     let loading_label = match self.stream_method {
-                        StreamMethod::HCNetSDK => "HCNetSDK (janela X11 separada)",
+                        StreamMethod::HCNetSDK => "HCNetSDK (callback mode)",
+                        StreamMethod::HCNetSDK_X11 => "HCNetSDK X11 (overlay mode)",
                         StreamMethod::PlayCtrl => "PlayCtrl decrypting...",
                         StreamMethod::Snapshot => "Polling snapshot...",
                         StreamMethod::ZeroChannel => "Canal Zero decrypting...",
@@ -954,16 +1184,28 @@ impl HikvisionApp {
         let cell_h = ((avail.y - spacing * (rows - 1.0)) / rows).max(1.0);
         let cell_size = egui::vec2(cell_w, cell_h);
 
+        // Para modo X11 overlay, sincronizar janelas filhas com as células
+        let is_x11 = self.stream_method.is_x11_overlay();
+
         for row in 0..self.layout_mode.rows() {
             ui.horizontal(|ui| {
                 for col in 0..self.layout_mode.cols() {
+                    let idx = row * self.layout_mode.cols() + col;
                     let (rect, _response) = ui.allocate_exact_size(cell_size, egui::Sense::click());
+
+                    if is_x11 {
+                        // Modo X11: sincronizar janela overlay com a posição da célula
+                        if let Some(ref mut mgr) = self.x11_manager {
+                            mgr.ensure_window(idx, rect.min.x, rect.min.y, cell_size.x, cell_size.y);
+                        }
+                    }
+
                     let mut cell_ui = ui.new_child(
                         egui::UiBuilder::new()
                             .max_rect(rect)
                             .layout(egui::Layout::top_down(egui::Align::Center)),
                     );
-                    self.render_cell(&mut cell_ui, row * self.layout_mode.cols() + col, cell_size);
+                    self.render_cell(&mut cell_ui, idx, cell_size);
                 }
             });
         }
@@ -977,23 +1219,40 @@ impl HikvisionApp {
             egui::Color32::from_rgb(10, 10, 10),
         );
 
-        if idx >= self.streams.len() {
-            let label = if idx < self.channels.len() {
-                format!("[{}] {}", self.channels[idx].id, self.channels[idx].name)
-            } else {
-                "No Signal".to_string()
-            };
+        if idx >= self.channels.len() {
             ui.add_space(cell_size.y * 0.4);
-            ui.colored_label(egui::Color32::DARK_GRAY, label);
+            ui.colored_label(egui::Color32::DARK_GRAY, "No Signal");
             return;
         }
 
-        let state = &self.streams[idx];
         let channel_name = if idx < self.channels.len() {
             format!("[{}]", self.channels[idx].id)
         } else {
             format!("Ch {}", idx + 1)
         };
+
+        // Modo X11 overlay: o SDK renderiza direto na janela X11.
+        // Não desenhamos textura via egui — apenas mostramos o label.
+        if self.stream_method.is_x11_overlay() {
+            let is_active = self.channel_is_active(idx);
+            ui.add_space(cell_size.y * 0.35);
+            ui.colored_label(egui::Color32::WHITE, &channel_name);
+            if is_active {
+                ui.colored_label(egui::Color32::DARK_GREEN, "● Live");
+            } else {
+                ui.colored_label(egui::Color32::DARK_GRAY, "Sem Sinal");
+            }
+            return;
+        }
+
+        // Modos baseados em texture (RTSP, Snapshot, PlayCtrl, HCNetSDK callback)
+        if idx >= self.streams.len() {
+            ui.add_space(cell_size.y * 0.4);
+            ui.colored_label(egui::Color32::DARK_GRAY, &channel_name);
+            return;
+        }
+
+        let state = &self.streams[idx];
 
         if let Some(ref tex) = state.texture {
             let label_h = 18.0;
@@ -1034,12 +1293,8 @@ impl HikvisionApp {
         } else {
             ui.add_space(cell_size.y * 0.35);
             ui.colored_label(egui::Color32::GRAY, &channel_name);
-            if state.stream_handle.is_some() {
-                if self.stream_method == StreamMethod::HCNetSDK {
-                    ui.colored_label(egui::Color32::YELLOW, "Veja janela X11");
-                } else {
-                    ui.colored_label(egui::Color32::DARK_GRAY, "Aguardando...");
-                }
+            if idx < self.streams.len() && (self.streams[idx].stream_handle.is_some() || self.streams[idx].frame_rx.is_some()) {
+                ui.colored_label(egui::Color32::DARK_GRAY, "Aguardando...");
             } else {
                 ui.colored_label(egui::Color32::DARK_GRAY, "Sem Sinal");
             }
@@ -1048,19 +1303,40 @@ impl HikvisionApp {
 }
 
 impl eframe::App for HikvisionApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.api.is_some() && !self.channels.is_empty() {
-            // Poll HCNetSDK X11 events (must be on main thread, like rustdemo)
-            if let Some(ref mut stream) = self.hcnetsdk_stream {
-                if !stream.poll_window_events() {
-                    log::info!("HCNetSDK preview window closed by user");
-                    let _ = stream.stop();
-                    self.hcnetsdk_stream = None;
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Obter XID da janela principal no primeiro frame (para X11 overlay)
+        if !self.x11_window_xid_obtained {
+            if let Ok(wh) = frame.window_handle() {
+                let raw = wh.as_raw();
+                if let Some(xid) = x11_embed::xid_from_raw_handle(&raw) {
+                    self.x11_main_xid = Some(xid);
+                    x11_embed::set_main_window_xid(xid);
+                    self.x11_window_xid_obtained = true;
+                    log::info!("Main window XID: 0x{:x}", xid);
                 }
             }
+        }
+
+        // Atualizar posição global da janela principal para overlay X11
+        if self.x11_window_xid_obtained {
+            x11_embed::update_main_window_pos_from_x11();
+        }
+
+        // Poll X11 events de todas as janelas overlay
+        if let Some(ref mut mgr) = self.x11_manager {
+            mgr.poll_all();
+        }
+
+        if self.api.is_some() && !self.channels.is_empty() {
             self.drain_frames(ctx);
             ctx.request_repaint();
             self.show_viewer(ctx);
+
+            // Após show_viewer(), as janelas X11 já foram criadas por ensure_window().
+            // Agora podemos iniciar streams pendentes.
+            if self.stream_method.is_x11_overlay() {
+                self.try_start_pending_x11_streams();
+            }
         } else {
             self.show_login(ctx);
         }
@@ -1068,6 +1344,9 @@ impl eframe::App for HikvisionApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.stop_all_streams();
+        self.x11_manager = None;
+        self.hcnetsdk_x11_multi = None;
+        self.x11_pending.clear();
     }
 }
 
@@ -1076,6 +1355,11 @@ fn main() {
 
     ffmpeg_next::init().expect("Failed to initialize FFmpeg");
     ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Warning);
+
+    // Initialize X11 connection for overlay windows
+    if x11_embed::init_x11().is_none() {
+        log::warn!("X11 connection failed — X11 overlay mode will not work");
+    }
 
     // Initialize HCNetSDK on the main thread (required by the Hikvision SDK
     // for X11/rendering resource initialization) before spawning any threads.

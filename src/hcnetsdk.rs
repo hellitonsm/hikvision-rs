@@ -543,6 +543,39 @@ impl HCNetSDK {
         Ok(handle)
     }
 
+    /// Start real-time preview com callback (non-blocking, para multi-câmera).
+    ///
+    /// hPlayWnd=0, bBlocked=0 — o SDK retorna imediatamente e chama o callback
+    /// com dados de áudio/vídeo em tempo real. Útil para split-screen multi-câmera.
+    pub fn realplay_with_callback(
+        &self,
+        user_id: LONG,
+        channel: LONG,
+        stream_type: DWORD,
+        link_mode: DWORD,
+        callback: REALDATACALLBACK,
+        user_data: *mut c_void,
+    ) -> Result<LONG> {
+        let mut preview_info: NET_DVR_PREVIEWINFO = unsafe { std::mem::zeroed() };
+
+        preview_info.lChannel = channel;
+        preview_info.dwStreamType = stream_type;
+        preview_info.dwLinkMode = link_mode;
+        preview_info.hPlayWnd = 0;
+        preview_info.bBlocked = 0;
+        preview_info.dwDisplayBufNum = 1;
+
+        let handle = unsafe { (self._realplay_v40)(user_id, &preview_info, Some(callback), user_data) };
+
+        if handle < 0 {
+            let err = self.get_last_error();
+            anyhow::bail!("NET_DVR_RealPlay_V40 (callback) failed (error {})", err);
+        }
+
+        log::info!("RealPlay (callback) started, channel={}, handle={}", channel, handle);
+        Ok(handle)
+    }
+
     /// Start real-time preview com janela X11 direta (conforme ARCHITECTURE.md).
     ///
     /// O SDK renderiza vídeo diretamente na janela via overlay — sem callback.
