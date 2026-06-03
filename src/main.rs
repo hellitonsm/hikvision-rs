@@ -956,6 +956,15 @@ impl HikvisionApp {
     fn show_viewer(&mut self, ctx: &egui::Context) {
         if self.layout_mode != self.prev_layout {
             self.prev_layout = self.layout_mode;
+
+            // No modo X11 overlay, destruir todas as janelas overlay antes
+            // de recriar com as posições do novo layout
+            if self.stream_method.is_x11_overlay() {
+                if let Some(ref mut mgr) = self.x11_manager {
+                    mgr.clear();
+                }
+            }
+
             for i in 0..self.streams.len() {
                 if self.channel_is_active(i) {
                     self.stop_stream(i);
