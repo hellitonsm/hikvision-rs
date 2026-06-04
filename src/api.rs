@@ -290,6 +290,40 @@ impl HikvisionAPI {
         let path = format!("/ISAPI/Streaming/channels/{}/picture", cid);
         self.get_bytes(&path)
     }
+
+    /// Verifica se o Canal Zero está **ativado** no dispositivo.
+    ///
+    /// Consulta `/ISAPI/Streaming/zeroChannels` para determinar se o Canal Zero
+    /// está configurado como ativo. Isso é diferente de [`DeviceInfo::zero_chan_num`],
+    /// que indica apenas se o dispositivo **suporta** Canal Zero.
+    ///
+    /// # Retorno
+    ///
+    /// - `Ok(true)` — Canal Zero está suportado e ativado.
+    /// - `Ok(false)` — Canal Zero está suportado mas desativado, ou não suportado.
+    /// - `Err(_)` — Falha ao consultar (ISAPI não disponível, erro de rede, etc.).
+    pub fn zero_channel_enabled(&self) -> Result<bool> {
+        log::info!("Checking if zero channel is enabled");
+        let xml = self.get_text("/ISAPI/Streaming/zeroChannels")?;
+
+        // Parse: <ZeroChannelList><ZeroChannel><enabled>true</enabled></ZeroChannel></ZeroChannelList>
+        // Some devices use <zeroChannel> or <ZeroChannel> with <enabled> or <enable>
+        for line in xml.lines() {
+            let line_lower = line.trim().to_lowercase();
+            if line_lower.contains("<enabled>") || line_lower.contains("<enable>") {
+                if line_lower.contains("true") || line_lower.contains("1") {
+                    return Ok(true);
+                }
+            }
+        }
+
+        // Alternative format: check for any <ZeroChannel> node with enabled=true
+        if xml.to_lowercase().contains("enabled>true") || xml.to_lowercase().contains("enabled>1") {
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
 }
 
 /// Parseia o cabeçalho `WWW-Authenticate: Digest ...` em pares chave/valor.

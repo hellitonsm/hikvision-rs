@@ -11,6 +11,68 @@ use crate::netstream::NetStream;
 use crate::playctrl::{self, PlayCtrl};
 use crate::rtsp::RtspFrame;
 
+/// Classified error for zero channel operations.
+///
+/// Used to decide fallback and retry strategy: whether to try the next channel ID,
+/// retry the same one with backoff, or abort entirely.
+#[derive(Debug)]
+enum ZeroChannelError {
+    /// Device does not have zero channel capability (404, 461, SDK error 953)
+    NotSupported,
+    /// Device has zero channel but it's not enabled in settings
+    NotEnabled,
+    /// Authentication failed (401, 403) — retrying other IDs won't help
+    AuthFailed,
+    /// Verification code is required but missing
+    VerificationCodeRequired,
+    /// Network unreachable (connection refused, timeout)
+    ConnectionRefused,
+    /// Generic stream/decode error — may be transient
+    StreamError(String),
+}
+
+impl std::fmt::Display for ZeroChannelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotSupported => write!(f, "Canal Zero não suportado pelo dispositivo"),
+            Self::NotEnabled => write!(f, "Canal Zero não está ativado nas configurações do DVR"),
+            Self::AuthFailed => write!(f, "Falha de autenticação (credenciais inválidas)"),
+            Self::VerificationCodeRequired => write!(f, "Verification Code obrigatório para Canal Zero"),
+            Self::ConnectionRefused => write!(f, "Conexão recusada/host inalcançável"),
+            Self::StreamError(msg) => write!(f, "Erro de stream: {}", msg),
+        }
+    }
+}
+
+fn classify_zero_channel_error(e: &anyhow::Error) -> ZeroChannelError {
+    let err_str = e.to_string().to_lowercase();
+    let err_source = e.source().map(|s| s.to_string()).unwrap_or_default().to_lowercase();
+    let combined = format!("{} {}", err_str, err_source);
+
+    // SDK error 953 = NET_ERR_NO_ZERO_CHAN
+    if combined.contains("953") || combined.contains("no_zero_chan") {
+        return ZeroChannelError::NotSupported;
+    }
+    // RTSP/HTTP: not found, unsupported transport, not ready
+    if combined.contains("404") || combined.contains("461") || combined.contains("462") {
+        return ZeroChannelError::NotSupported;
+    }
+    // Auth failures — no point trying other IDs
+    if combined.contains("401") || combined.contains("403") || combined.contains("unauthorized") {
+        return ZeroChannelError::AuthFailed;
+    }
+    // Connection refused / timeout
+    if combined.contains("refused") || combined.contains("timed out") || combined.contains("timeout") {
+        return ZeroChannelError::ConnectionRefused;
+    }
+    // Describe/setup/play RTSP failures that indicate channel doesn't exist
+    if combined.contains("describe failed") || combined.contains("setup failed") {
+        return ZeroChannelError::NotSupported;
+    }
+
+    ZeroChannelError::StreamError(e.to_string())
+}
+
 use ffmpeg_next::codec::{self as codec_mod, Context as CodecContext, Id as CodecId};
 use ffmpeg_next::packet::Packet;
 use ffmpeg_next::software::scaling::Context as SwsContext;
@@ -615,24 +677,29 @@ pub fn zero_channel_stream_loop(
         let _ = tx.try_send(RtspFrame {
             width: 640,
             height: 480,
-            rgba: vec![0u8; 640 * 480 * 4], // Black frame
+            rgba: vec![0u8; 640 * 480 * 4],
         });
         return;
     }
 
-    // Tentar múltiplos IDs de canal se o primeiro falhar
     let channel_ids_to_try: Vec<&str> = if channel == "001" || channel == "0" || channel == "1" {
-        vec!["001", "0", "1"] // Ordem de preferência
+        vec!["001", "0", "1"]
     } else {
         vec![channel]
     };
 
-    for channel_id in channel_ids_to_try {
+    // Track the last error per channel ID for final summary
+    let mut id_errors: Vec<(&str, ZeroChannelError)> = Vec::new();
+
+    for channel_id in &channel_ids_to_try {
         if stop.load(Ordering::Relaxed) {
             return;
         }
 
         log::info!("Tentando Canal Zero com ID: {}", channel_id);
+
+        let mut backoff_secs: f64 = 1.0;
+        const MAX_BACKOFF_SECS: f64 = 30.0;
 
         loop {
             if stop.load(Ordering::Relaxed) {
@@ -643,31 +710,73 @@ pub fn zero_channel_stream_loop(
                 &tx, &stop, &repaint,
             ) {
                 Ok(()) => {
-                    log::info!("Zero channel session ended normally");
+                    log::info!("Zero channel session ended normally (ID={})", channel_id);
                     return;
                 }
                 Err(e) => {
-                    let err_str = e.to_string();
+                    let classified = classify_zero_channel_error(&e);
 
-                    // Erro 953 = NET_ERR_NO_ZERO_CHAN (canal zero não disponível)
-                    if err_str.contains("404") || err_str.contains("401") || err_str.contains("refused") {
-                        log::warn!("Canal Zero ID {} não disponível: {}", channel_id, e);
-                        break; // Tentar próximo ID
-                    }
-
-                    log::error!("Zero channel stream error: {}, reconnecting in 2s...", e);
-                    for _ in 0..20 {
-                        if stop.load(Ordering::Relaxed) {
+                    match classified {
+                        ZeroChannelError::NotSupported | ZeroChannelError::NotEnabled => {
+                            log::warn!("Canal Zero ID {} → {}: {}", channel_id, classified, e);
+                            id_errors.push((*channel_id, classified));
+                            break; // Try next channel ID
+                        }
+                        ZeroChannelError::AuthFailed => {
+                            log::error!("Autenticação falhou para Canal Zero ID {}: {} — abortando (outros IDs também falharão)", channel_id, e);
+                            id_errors.push((*channel_id, ZeroChannelError::AuthFailed));
+                            // No point trying other IDs with same credentials
+                            log_id_errors_summary(&id_errors);
                             return;
                         }
-                        std::thread::sleep(Duration::from_millis(100));
+                        ZeroChannelError::VerificationCodeRequired => {
+                            log::error!("Verification Code obrigatório para Canal Zero");
+                            id_errors.push((*channel_id, ZeroChannelError::VerificationCodeRequired));
+                            log_id_errors_summary(&id_errors);
+                            return;
+                        }
+                        ZeroChannelError::ConnectionRefused => {
+                            log::warn!("Canal Zero ID {} → conexão recusada: {}", channel_id, e);
+                            id_errors.push((*channel_id, ZeroChannelError::ConnectionRefused));
+                            break; // Try next ID (different model may use different port/path)
+                        }
+                        ZeroChannelError::StreamError(_) => {
+                            log::error!("Zero channel stream error (ID={}): {}, reconectando em {:.0}s...", channel_id, e, backoff_secs);
+                            sleep_with_stop(&stop, backoff_secs);
+                            backoff_secs = (backoff_secs * 2.0).min(MAX_BACKOFF_SECS);
+                        }
                     }
                 }
             }
         }
     }
 
-    log::error!("Todos os IDs de Canal Zero falharam");
+    log_id_errors_summary(&id_errors);
+}
+
+fn log_id_errors_summary(errors: &[(impl AsRef<str>, ZeroChannelError)]) {
+    if errors.is_empty() {
+        log::error!("Todos os IDs de Canal Zero falharam (sem detalhes)");
+        return;
+    }
+    log::error!("Todos os IDs de Canal Zero falharam:");
+    for (id, err) in errors {
+        log::error!("  ID {} → {}", id.as_ref(), err);
+    }
+}
+
+fn sleep_with_stop(stop: &AtomicBool, seconds: f64) {
+    let millis = (seconds * 1000.0) as u64;
+    let check_interval = Duration::from_millis(100);
+    let mut remaining = Duration::from_millis(millis);
+    while remaining > Duration::ZERO {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let sleep_time = remaining.min(check_interval);
+        std::thread::sleep(sleep_time);
+        remaining = remaining.saturating_sub(check_interval);
+    }
 }
 
 fn run_zero_channel(
@@ -748,17 +857,6 @@ fn run_zero_channel(
 
                 if decrypted.is_empty() { continue; }
 
-                // Log dos primeiros frames para debug
-                if frame_count < 3 {
-                    log::info!("Zero ch: Frame {} - {} bytes, NAL type: {}, keyframe: {}",
-                        frame_count,
-                        decrypted.len(),
-                        decrypted[0] & 0x1F,
-                        (decrypted[0] & 0x1F) == 5
-                    );
-                }
-
-                // Log dos primeiros frames para debug
                 if frame_count < 3 {
                     log::info!("Zero ch: Frame {} - {} bytes, NAL type: {}, keyframe: {}",
                         frame_count,
@@ -824,15 +922,6 @@ fn run_zero_channel(
 
                 frame_count += 1;
                 byte_count += rtp_data.len() as u64;
-
-                // FU-A end bit completou o NAL unit
-                if nal_type == 28 && decrypted.len() >= 2 {
-                    let fu_header = decrypted[1];
-                    let end_bit = (fu_header >> 6) & 0x01;
-                    if end_bit != 0 {
-                        log::trace!("Zero ch: FU-A end bit detected, flushing {} bytes", nal_buf.len());
-                    }
-                }
 
                 // FU-A end bit completou o NAL unit
                 if nal_type == 28 && decrypted.len() >= 2 {

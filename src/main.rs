@@ -299,6 +299,9 @@ struct HikvisionApp {
     channels: Vec<Channel>,
     device_name: String,
     device_supports_zero_channel: bool,
+    zero_channel_enabled: Option<bool>,
+    /// SDK channel number base for Canal Zero: byStartChan + byChanNum + byIPChanNum.
+    zero_ch_base: Option<i32>,
     error: Option<String>,
 
     layout_mode: LayoutMode,
@@ -334,6 +337,8 @@ impl Default for HikvisionApp {
             channels: Vec::new(),
             device_name: String::new(),
             device_supports_zero_channel: false,
+            zero_channel_enabled: None,
+            zero_ch_base: None,
             error: None,
             layout_mode: LayoutMode::Single,
             prev_layout: LayoutMode::Single,
@@ -379,6 +384,65 @@ impl HikvisionApp {
                     format!("{} | {} | {}", info.name, info.model, info.firmware);
                 self.device_supports_zero_channel = info.zero_chan_num > 0;
 
+                // Para modos SDK, sondar byZeroChanNum via login SDK
+                // (mais confiável que ISAPI para alguns dispositivos)
+                if self.stream_method == StreamMethod::HCNetSDK
+                    || self.stream_method == StreamMethod::HCNetSDK_X11
+                {
+                    let sdk_port: u16 = self.sdk_port.trim().parse().unwrap_or(8000);
+                    log::info!("Probing SDK for Canal Zero support & channel base");
+                    if let Some(sdk) = hcnetsdk::try_global_sdk() {
+                        match sdk.login(&host, sdk_port, &user, &password) {
+                            Ok((uid, dev_info)) => {
+                                let v30 = dev_info.struDeviceV30;
+                                let sdk_zero = v30.byZeroChanNum;
+                                if sdk_zero > 0 {
+                                    log::info!("SDK reports byZeroChanNum={} — Canal Zero suportado", sdk_zero);
+                                    self.device_supports_zero_channel = true;
+
+                                    // Verificar/ativar Canal Zero via SDK
+                                    match sdk.ensure_zero_channel_enabled(uid, true) {
+                                        Ok((enabled, was_enabled)) => {
+                                            if enabled {
+                                                self.zero_channel_enabled = Some(true);
+                                                if was_enabled {
+                                                    log::info!("Canal Zero ativado via SDK (estava desabilitado)");
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            log::warn!("Failed to check/enable Canal Zero via SDK: {}", e);
+                                        }
+                                    }
+                                } else {
+                                    log::info!("SDK reports byZeroChanNum=0 — Canal Zero não suportado via SDK");
+                                }
+                                let base = v30.byStartChan as i32
+                                    + v30.byChanNum as i32
+                                    + v30.byIPChanNum as i32;
+                                log::info!(
+                                    "SDK channel base: byStartChan={} + byChanNum={} + byIPChanNum={} = {}",
+                                    v30.byStartChan, v30.byChanNum, v30.byIPChanNum, base
+                                );
+                                self.zero_ch_base = Some(base);
+                                let _ = sdk.logout(uid);
+                            }
+                            Err(e) => {
+                                log::warn!("SDK login probe failed: {} — using ISAPI value", e);
+                            }
+                        }
+                    } else {
+                        log::warn!("HCNetSDK not initialized, skipping SDK Canal Zero probe");
+                    }
+                }
+
+                // Para modos SDK, sempre oferecer Canal Zero na lista se suportado.
+                // Se ISAPI e SDK não detectaram, incluir mesmo assim — o SDK
+                // reportará erro 953 (NET_ERR_NO_ZERO_CHAN) ao tentar iniciar.
+                let offer_zero_ch = self.stream_method == StreamMethod::ZeroChannel
+                    || self.stream_method == StreamMethod::HCNetSDK
+                    || self.stream_method == StreamMethod::HCNetSDK_X11;
+
                 if self.stream_method == StreamMethod::ZeroChannel && !self.device_supports_zero_channel {
                     log::warn!("Canal Zero solicitado mas dispositivo não suporta (zeroChanNum={})", info.zero_chan_num);
                     self.error = Some("Dispositivo não suporta Canal Zero. Desative a opção ou ative no DVR.".into());
@@ -387,6 +451,28 @@ impl HikvisionApp {
 
                 if self.device_supports_zero_channel {
                     log::info!("Dispositivo suporta Canal Zero (zeroChanNum={})", info.zero_chan_num);
+
+                    // Check if Canal Zero is actually enabled
+                    match api.zero_channel_enabled() {
+                        Ok(true) => {
+                            log::info!("Canal Zero está ativado no dispositivo");
+                            self.zero_channel_enabled = Some(true);
+                        }
+                        Ok(false) => {
+                            log::warn!("Canal Zero suportado mas NÃO ativado nas configurações do DVR");
+                            self.zero_channel_enabled = Some(false);
+                            if self.stream_method == StreamMethod::ZeroChannel {
+                                self.error = Some("Canal Zero não está ativado. Ative em: DVR > Configurações > Visualização > Canal Zero".into());
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("Não foi possível verificar se Canal Zero está ativado: {}", e);
+                            self.zero_channel_enabled = None;
+                        }
+                    }
+                } else {
+                    self.zero_channel_enabled = None;
                 }
 
                 match api.channels() {
@@ -402,8 +488,11 @@ impl HikvisionApp {
                                 }
                             }
                         }
-                        if self.stream_method == StreamMethod::ZeroChannel {
-                            if !deduped.iter().any(|c| c.id == "001") {
+                        if offer_zero_ch && !deduped.iter().any(|c| c.id == "001") {
+                            let include = self.device_supports_zero_channel
+                                || self.stream_method == StreamMethod::HCNetSDK
+                                || self.stream_method == StreamMethod::HCNetSDK_X11;
+                            if include {
                                 deduped.insert(0, Channel {
                                     id: "001".to_string(),
                                     name: "Canal Zero".to_string(),
@@ -492,6 +581,18 @@ impl HikvisionApp {
         )
     }
 
+    /// Compute the SDK channel number for NET_DVR_PREVIEWINFO.lChannel.
+    /// For Canal Zero: lChannel=1 (virtual channel index for zero channel).
+    /// For normal channels: lChannel=channel_id/100.
+    fn sdk_channel_for(&self, channel_id: &str) -> i32 {
+        let is_zero_ch = channel_id == "001" || channel_id == "1" || channel_id == "0";
+        if is_zero_ch {
+            1
+        } else {
+            channel_id.trim().parse::<i32>().unwrap_or(100) / 100
+        }
+    }
+
     fn start_stream(&mut self, channel_index: usize, ctx: &egui::Context) {
         if channel_index >= self.channels.len() {
             return;
@@ -524,6 +625,9 @@ impl HikvisionApp {
         let stop = Arc::new(AtomicBool::new(false));
         let repaint_ctx = ctx.clone();
 
+        // Pre-compute SDK channel before mutable borrow of self.streams
+        let sdk_channel = self.sdk_channel_for(&channel_id);
+
         let state = &mut self.streams[channel_index];
         state.frame_rx = Some(rx);
         state.stream_stop = Some(stop.clone());
@@ -536,6 +640,7 @@ impl HikvisionApp {
                 log::info!("Starting zero-channel stream (FFmpeg+decrypt) for {}: {}", channel_id, channel_name);
                 if verification_code.trim().is_empty() {
                     log::error!("Canal Zero requer Verification Code para descriptografia");
+                    self.error = Some("Canal Zero requer Verification Code para descriptografia AES. Preencha o campo na configuração.".into());
                     return;
                 }
                 let cid = channel_id.clone();
@@ -559,8 +664,12 @@ impl HikvisionApp {
                 state.stream_handle = Some(handle);
             }
             StreamMethod::HCNetSDK => {
-                let sdk_channel: i32 = channel_id.trim().parse::<i32>().unwrap_or(100) / 100;
-                log::info!("Starting HCNetSDK callback stream ch {} (sdk={})", channel_id, sdk_channel);
+                let main_stream = !force_sub || is_zero_ch;
+                if is_zero_ch {
+                    log::info!("Starting HCNetSDK callback stream — Canal Zero (sdk_channel={})", sdk_channel);
+                } else {
+                    log::info!("Starting HCNetSDK callback stream ch {} (sdk={})", channel_id, sdk_channel);
+                }
 
                 let vc = if verification_code.is_empty() {
                     None
@@ -589,7 +698,7 @@ impl HikvisionApp {
                 }
 
                 let multi = self.hcnetsdk_multi.as_mut().unwrap();
-                match multi.start_channel(sdk_channel, !force_sub) {
+                match multi.start_channel(sdk_channel, main_stream) {
                     Ok(rx) => {
                         state.frame_rx = Some(rx);
                         log::info!("HCNetSDK callback ch {} started", sdk_channel);
@@ -601,10 +710,12 @@ impl HikvisionApp {
                 }
             }
             StreamMethod::HCNetSDK_X11 => {
-                let sdk_channel: i32 = channel_id.trim().parse::<i32>().unwrap_or(100) / 100;
-                log::info!("Starting HCNetSDK X11 direct stream ch {} (sdk={})", channel_id, sdk_channel);
+                if is_zero_ch {
+                    log::info!("Starting HCNetSDK X11 direct stream — Canal Zero (sdk_channel={})", sdk_channel);
+                } else {
+                    log::info!("Starting HCNetSDK X11 direct stream ch {} (sdk={})", channel_id, sdk_channel);
+                }
 
-                // Garantir login do SDK
                 if self.x11_main_xid.is_some() {
                     let vc = if verification_code.is_empty() {
                         None
@@ -627,15 +738,11 @@ impl HikvisionApp {
                         }
                     }
 
-                    // A janela X11 é criada por ensure_window() durante a renderização.
-                    // Marcamos este canal como pendente — try_start_pending_x11_streams()
-                    // o iniciará após a janela existir.
                     if !self.x11_pending.contains(&channel_index) {
                         self.x11_pending.push(channel_index);
                         log::info!("Channel index {} marked as X11 pending (window not yet created)", channel_index);
                     }
 
-                    // Tenta iniciar imediatamente se a janela já existe
                     self.try_start_pending_x11_streams();
                 } else {
                     log::warn!("X11 main window XID not available yet, deferring X11 stream start");
@@ -674,8 +781,7 @@ impl HikvisionApp {
     fn stop_stream(&mut self, channel_index: usize) {
         if self.stream_method == StreamMethod::HCNetSDK_X11 {
             if channel_index < self.channels.len() {
-                let channel_id = &self.channels[channel_index].id;
-                let sdk_channel: i32 = channel_id.trim().parse::<i32>().unwrap_or(100) / 100;
+                let sdk_channel = self.sdk_channel_for(&self.channels[channel_index].id);
                 if let Some(ref mut multi) = self.hcnetsdk_x11_multi {
                     multi.stop_channel(sdk_channel);
                 }
@@ -697,8 +803,7 @@ impl HikvisionApp {
 
         if self.stream_method == StreamMethod::HCNetSDK {
             if channel_index < self.channels.len() {
-                let channel_id = &self.channels[channel_index].id;
-                let sdk_channel: i32 = channel_id.trim().parse::<i32>().unwrap_or(100) / 100;
+                let sdk_channel = self.sdk_channel_for(&self.channels[channel_index].id);
                 if let Some(ref mut multi) = self.hcnetsdk_multi {
                     multi.stop_channel(sdk_channel);
                 }
@@ -780,24 +885,25 @@ impl HikvisionApp {
                 continue;
             }
             let channel_id = &self.channels[idx].id;
-            let sdk_channel: i32 = channel_id.trim().parse::<i32>().unwrap_or(100) / 100;
+                    let sdk_channel = self.sdk_channel_for(channel_id);
 
-            // Já está ativo? Remove dos pendentes.
-            if self.hcnetsdk_x11_multi.as_ref().map(|m| m.is_channel_active(sdk_channel)).unwrap_or(false) {
-                log::info!("X11 pending: channel {} already active, removing from pending", sdk_channel);
-                continue;
-            }
+                    // Já está ativo? Remove dos pendentes.
+                    if self.hcnetsdk_x11_multi.as_ref().map(|m| m.is_channel_active(sdk_channel)).unwrap_or(false) {
+                        log::info!("X11 pending: channel {} already active, removing from pending", sdk_channel);
+                        continue;
+                    }
 
-            // Verifica se a janela X11 existe
-            let win_id = self.x11_manager.as_ref().and_then(|mgr| mgr.window_id(idx));
-            match win_id {
-                Some(win_id) => {
-                    let force_sub = matches!(
-                        self.layout_mode,
-                        LayoutMode::Grid2x2 | LayoutMode::Grid3x3 | LayoutMode::Grid4x4
-                    );
-                    let multi = self.hcnetsdk_x11_multi.as_mut().unwrap();
-                    match multi.start_channel(sdk_channel, !force_sub, win_id) {
+                    // Verifica se a janela X11 existe
+                    let is_zero_ch = channel_id == "001" || channel_id == "1" || channel_id == "0";
+                    let win_id = self.x11_manager.as_ref().and_then(|mgr| mgr.window_id(idx));
+                    match win_id {
+                        Some(win_id) => {
+                            let force_sub = matches!(
+                                self.layout_mode,
+                                LayoutMode::Grid2x2 | LayoutMode::Grid3x3 | LayoutMode::Grid4x4
+                            ) && !is_zero_ch;
+                            let multi = self.hcnetsdk_x11_multi.as_mut().unwrap();
+                            match multi.start_channel(sdk_channel, !force_sub, win_id) {
                         Ok(()) => {
                             log::info!("X11 pending: channel {} started on window 0x{:x}", sdk_channel, win_id);
                         }
@@ -821,8 +927,7 @@ impl HikvisionApp {
             if idx >= self.channels.len() {
                 return false;
             }
-            let channel_id = &self.channels[idx].id;
-            let sdk_channel: i32 = channel_id.trim().parse::<i32>().unwrap_or(100) / 100;
+            let sdk_channel = self.sdk_channel_for(&self.channels[idx].id);
             return self.hcnetsdk_x11_multi.as_ref()
                 .map(|m| m.is_channel_active(sdk_channel))
                 .unwrap_or(false)
@@ -1019,7 +1124,11 @@ impl HikvisionApp {
             ui.horizontal(|ui| {
                 ui.label(&self.device_name);
                 if self.device_supports_zero_channel {
-                    ui.label(egui::RichText::new("🔀 Canal Zero OK").small().color(egui::Color32::GREEN));
+                    match self.zero_channel_enabled {
+                        Some(true) => { ui.label(egui::RichText::new("🔀 Canal Zero OK").small().color(egui::Color32::GREEN)); }
+                        Some(false) => { ui.label(egui::RichText::new("🔀 Canal Zero DESATIVADO").small().color(egui::Color32::YELLOW)); }
+                        None => { ui.label(egui::RichText::new("🔀 Canal Zero suportado").small().color(egui::Color32::from_rgb(120, 120, 120))); }
+                    }
                 }
                 if self.streams.iter().any(|s| s.stream_handle.is_some() || s.frame_rx.is_some()) {
                     ui.separator();
@@ -1035,6 +1144,8 @@ impl HikvisionApp {
                         self.streams.clear();
                         self.focused_channel = None;
                         self.device_supports_zero_channel = false;
+                        self.zero_channel_enabled = None;
+                        self.zero_ch_base = None;
                     }
                 });
             });

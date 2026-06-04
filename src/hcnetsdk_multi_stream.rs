@@ -516,6 +516,14 @@ impl HCNetSDKMultiStream {
         self.device_info.struDeviceV30.byChanNum
     }
 
+    pub fn zero_channel_count(&self) -> u8 {
+        self.device_info.struDeviceV30.byZeroChanNum
+    }
+
+    pub fn supports_zero_channel(&self) -> bool {
+        self.device_info.struDeviceV30.byZeroChanNum > 0
+    }
+
     pub fn active_channel_count(&self) -> usize {
         self.channels.len()
     }

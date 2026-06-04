@@ -159,15 +159,18 @@ pub struct NET_DVR_USER_LOGIN_INFO {
 }
 
 /// Preview information for NET_DVR_RealPlay_V40
-/// Layout corresponde ao rustdemo (e ao HCNetSDK.h original)
+/// Layout matches HCNetSDK.h exactly (280 bytes on Linux x86_64).
+/// Note: byChanType does NOT exist in this struct — it belongs to
+/// NET_DVR_DEV_CHAN_INFO_EX and other channel-config structs.
+/// Canal Zero is selected via lChannel with the virtual channel index.
 #[repr(C)]
 pub struct NET_DVR_PREVIEWINFO {
     pub lChannel: LONG,
     pub dwStreamType: DWORD,
     pub dwLinkMode: DWORD,
     pub hPlayWnd: HWND,
-    pub bBlocked: BOOL,
-    pub bPassbackRecord: BOOL,
+    pub bBlocked: DWORD,
+    pub bPassbackRecord: DWORD,
     pub byPreviewMode: u8,
     pub byStreamID: [u8; 32],
     pub byProtoType: u8,
@@ -175,11 +178,27 @@ pub struct NET_DVR_PREVIEWINFO {
     pub byVideoCodingType: u8,
     pub dwDisplayBufNum: DWORD,
     pub byNPQMode: u8,
-    pub byRes: [u8; 215],
+    pub byRecvMetaData: u8,
+    pub byDataType: u8,
+    pub byRes: [u8; 213],
 }
 
 /// Callback type for real-time stream data
 pub type REALDATACALLBACK = extern "C" fn(LONG, DWORD, *mut u8, DWORD, *mut c_void);
+
+/// Zero channel configuration (command 1102/1103)
+#[repr(C)]
+pub struct NET_DVR_ZEROCHANCFG {
+    pub dwSize: u32,
+    pub byEnable: u8,        // 0=disabled, 1=enabled
+    pub byRes1: [u8; 3],
+    pub dwVideoBitrate: u32,
+    pub dwVideoFrameRate: u32,
+    pub byRes2: [u8; 32],
+}
+
+pub const NET_DVR_GET_ZEROCHANCFG: DWORD = 1102;
+pub const NET_DVR_SET_ZEROCHANCFG: DWORD = 1103;
 
 macro_rules! get_fn {
     ($lib:expr, $name:literal, $sig:ty) => {
@@ -327,6 +346,8 @@ pub struct HCNetSDK {
     _stop_realplay: unsafe extern "C" fn(LONG) -> BOOL,
     _get_last_error: unsafe extern "C" fn() -> DWORD,
     _set_player_buf_number: unsafe extern "C" fn(LONG) -> BOOL,
+    _get_dvr_config: unsafe extern "C" fn(LONG, DWORD, LONG, *mut c_void, DWORD, *mut DWORD) -> BOOL,
+    _set_dvr_config: unsafe extern "C" fn(LONG, DWORD, LONG, *const c_void, DWORD) -> BOOL,
 }
 
 impl HCNetSDK {
@@ -383,6 +404,8 @@ impl HCNetSDK {
         let stop_realplay = *get_fn!(_lib, b"NET_DVR_StopRealPlay", unsafe extern "C" fn(LONG) -> BOOL);
         let get_last_error = *get_fn!(_lib, b"NET_DVR_GetLastError", unsafe extern "C" fn() -> DWORD);
         let set_player_buf_number = *get_fn!(_lib, b"NET_DVR_SetPlayerBufNumber", unsafe extern "C" fn(LONG) -> BOOL);
+        let get_dvr_config = *get_fn!(_lib, b"NET_DVR_GetDVRConfig", unsafe extern "C" fn(LONG, DWORD, LONG, *mut c_void, DWORD, *mut DWORD) -> BOOL);
+        let set_dvr_config = *get_fn!(_lib, b"NET_DVR_SetDVRConfig", unsafe extern "C" fn(LONG, DWORD, LONG, *const c_void, DWORD) -> BOOL);
 
         log::info!("Loaded libhcnetsdk.so from {}", path.display());
 
@@ -417,6 +440,8 @@ impl HCNetSDK {
             _stop_realplay: stop_realplay,
             _get_last_error: get_last_error,
             _set_player_buf_number: set_player_buf_number,
+            _get_dvr_config: get_dvr_config,
+            _set_dvr_config: set_dvr_config,
         })
     }
 
@@ -529,7 +554,7 @@ impl HCNetSDK {
         preview_info.lChannel = channel;
         preview_info.dwStreamType = stream_type;
         preview_info.dwLinkMode = LINK_TCP;
-        preview_info.hPlayWnd = 0; // No window, use callback
+        preview_info.hPlayWnd = 0;
         preview_info.bBlocked = 1;
 
         let handle = unsafe { (self._realplay_v40)(user_id, &preview_info, Some(callback), user_data) };
@@ -590,7 +615,6 @@ impl HCNetSDK {
         preview_info.bBlocked = 1;
         preview_info.dwDisplayBufNum = 1;
 
-        // Callback NULL — o SDK renderiza direto na janela via X11 overlay
         let handle = unsafe { (self._realplay_v40)(user_id, &preview_info, None, std::ptr::null_mut()) };
 
         if handle < 0 {
@@ -629,6 +653,62 @@ impl HCNetSDK {
     /// Get last error code
     pub fn get_last_error(&self) -> DWORD {
         unsafe { (self._get_last_error)() }
+    }
+
+    /// Check if Canal Zero is enabled via SDK, and optionally enable it.
+    /// Uses NET_DVR_GET_ZEROCHANCFG (1102) / NET_DVR_SET_ZEROCHANCFG (1103).
+    /// Returns (currently_enabled, was_enabled_by_us).
+    pub fn ensure_zero_channel_enabled(&self, user_id: LONG, force_enable: bool) -> Result<(bool, bool)> {
+        let mut cfg: NET_DVR_ZEROCHANCFG = unsafe { std::mem::zeroed() };
+        cfg.dwSize = std::mem::size_of::<NET_DVR_ZEROCHANCFG>() as u32;
+        let mut bytes_returned: DWORD = 0;
+
+        let ret = unsafe {
+            (self._get_dvr_config)(
+                user_id,
+                NET_DVR_GET_ZEROCHANCFG,
+                0,
+                &mut cfg as *mut _ as *mut c_void,
+                cfg.dwSize,
+                &mut bytes_returned,
+            )
+        };
+
+        if ret == 0 {
+            let err = self.get_last_error();
+            anyhow::bail!("NET_DVR_GetDVRConfig(ZEROCHANCFG) failed (error {})", err);
+        }
+
+        if cfg.byEnable == 1 {
+            log::info!("Canal Zero already enabled (byEnable=1)");
+            return Ok((true, false));
+        }
+
+        if !force_enable {
+            log::warn!("Canal Zero is disabled (byEnable=0) and force_enable=false");
+            return Ok((false, false));
+        }
+
+        log::info!("Canal Zero disabled (byEnable=0), enabling via SDK...");
+        cfg.byEnable = 1;
+
+        let ret = unsafe {
+            (self._set_dvr_config)(
+                user_id,
+                NET_DVR_SET_ZEROCHANCFG,
+                0,
+                &cfg as *const _ as *const c_void,
+                cfg.dwSize,
+            )
+        };
+
+        if ret == 0 {
+            let err = self.get_last_error();
+            anyhow::bail!("NET_DVR_SetDVRConfig(ZEROCHANCFG) failed (error {})", err);
+        }
+
+        log::info!("Canal Zero enabled via SDK successfully");
+        Ok((true, true))
     }
 }
 
