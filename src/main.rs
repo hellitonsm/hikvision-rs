@@ -118,6 +118,7 @@ struct Config {
     verification_code: String,
     library_path: String,
     use_substream: bool,
+    use_https: bool,
     stream_method: StreamMethod,
     snapshot_interval: u64,
 }
@@ -134,6 +135,7 @@ impl Default for Config {
             verification_code: String::new(),
             library_path: String::new(),
             use_substream: false,
+            use_https: false,
             stream_method: StreamMethod::Snapshot,
             snapshot_interval: 300,
         }
@@ -192,6 +194,7 @@ impl Config {
                             verification_code: old.verification_code.unwrap_or_default(),
                             library_path: old.library_path.unwrap_or_default(),
                             use_substream: old.use_substream.unwrap_or(false),
+                            use_https: false,
                             stream_method,
                             snapshot_interval: old.snapshot_interval.unwrap_or(300),
                         };
@@ -233,6 +236,7 @@ impl Config {
         app.verification_code = self.verification_code.clone();
         app.library_path = self.library_path.clone();
         app.use_substream = self.use_substream;
+        app.use_https = self.use_https;
         app.stream_method = self.stream_method;
         app.snapshot_interval = self.snapshot_interval;
     }
@@ -248,6 +252,7 @@ impl Config {
             verification_code: app.verification_code.clone(),
             library_path: app.library_path.clone(),
             use_substream: app.use_substream,
+            use_https: app.use_https,
             stream_method: app.stream_method,
             snapshot_interval: app.snapshot_interval,
         }
@@ -292,6 +297,7 @@ struct HikvisionApp {
     verification_code: String,
     library_path: String,
     use_substream: bool,
+    use_https: bool,
     stream_method: StreamMethod,
     snapshot_interval: u64,
 
@@ -331,6 +337,7 @@ impl Default for HikvisionApp {
             verification_code: String::new(),
             library_path: String::new(),
             use_substream: false,
+            use_https: false,
             stream_method: StreamMethod::Snapshot,
             snapshot_interval: 300,
             api: None,
@@ -377,7 +384,7 @@ impl HikvisionApp {
             return;
         }
 
-        let api = HikvisionAPI::new(&host, port, &user, &password);
+        let api = HikvisionAPI::new(&host, port, &user, &password, self.use_https);
         match api.device_info() {
             Ok(info) => {
                 self.device_name =
@@ -611,6 +618,7 @@ impl HikvisionApp {
 
         let host = self.host.trim().to_string();
         let port: u16 = self.port.trim().parse().unwrap_or(80);
+        let use_https = self.use_https;
         let sdk_port: u16 = self.sdk_port.trim().parse().unwrap_or(8000);
         let rtsp_port: u16 = self.rtsp_port.trim().parse().unwrap_or(554);
         let user = self.user.trim().to_string();
@@ -658,7 +666,7 @@ impl HikvisionApp {
                 let cid = channel_id.clone();
                 let handle = thread::spawn(move || {
                     snapshot_stream::snapshot_stream_loop(
-                        &cid, &host, port, &user, &password, tx, stop, repaint_ctx, interval,
+                        &cid, &host, port, &user, &password, use_https, tx, stop, repaint_ctx, interval,
                     );
                 });
                 state.stream_handle = Some(handle);
@@ -992,8 +1000,21 @@ impl HikvisionApp {
                         ui.label("Host:");
                         ui.add_sized([field_w, field_h], egui::TextEdit::singleline(&mut self.host));
                         ui.end_row();
-                        ui.label("HTTP Port:");
+                        let port_label = if self.use_https { "HTTPS Port:" } else { "HTTP Port:" };
+                        ui.label(port_label);
                         ui.add_sized([field_w, field_h], egui::TextEdit::singleline(&mut self.port));
+                        ui.end_row();
+                        let prev_https = self.use_https;
+                        ui.label("HTTPS:");
+                        ui.checkbox(&mut self.use_https, "Usar HTTPS (certificado auto-assinado)");
+                        if self.use_https != prev_https {
+                            let cur_port = self.port.trim().parse().unwrap_or(0);
+                            if self.use_https && cur_port == 80 {
+                                self.port = "443".to_string();
+                            } else if !self.use_https && cur_port == 443 {
+                                self.port = "80".to_string();
+                            }
+                        }
                         ui.end_row();
                         ui.label("RTSP Port:");
                         ui.add_sized([field_w, field_h], egui::TextEdit::singleline(&mut self.rtsp_port));

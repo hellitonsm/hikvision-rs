@@ -16,16 +16,17 @@ fn print_usage() {
     eprintln!("Usage:");
     eprintln!("  jpeg_proxy --host <DVR_IP> --user <USER> --password <PASS>");
     eprintln!("            [--channel 101] [--port 80] [--listen 127.0.0.1:9001]");
-    eprintln!("            [--interval 500]");
+    eprintln!("            [--interval 500] [--https]");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --host        DVR IP address (required)");
     eprintln!("  --user        Username (default: admin)");
     eprintln!("  --password    DVR login password (required)");
     eprintln!("  --channel     Channel ID (default: 101 for ZeroChannel, try 101-164)");
-    eprintln!("  --port        HTTP port (default: 80)");
+    eprintln!("  --port        HTTP/HTTPS port (default: 80)");
     eprintln!("  --listen      Listen address (default: 127.0.0.1:9001)");
     eprintln!("  --interval    Poll interval in ms (default: 300)");
+    eprintln!("  --https       Use HTTPS (accept self-signed camera cert)");
 }
 
 struct Args {
@@ -36,6 +37,7 @@ struct Args {
     channel: String,
     listen: String,
     interval_ms: u64,
+    https: bool,
 }
 
 fn parse_args() -> Option<Args> {
@@ -54,6 +56,7 @@ fn parse_args() -> Option<Args> {
     let mut channel = "101".to_string();
     let mut listen = "127.0.0.1:9001".to_string();
     let mut interval_ms = 300u64;
+    let mut https = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -92,6 +95,9 @@ fn parse_args() -> Option<Args> {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(300);
             }
+            "--https" => {
+                https = true;
+            }
             _ => {
                 eprintln!("Unknown argument: {}", args[i]);
             }
@@ -107,6 +113,7 @@ fn parse_args() -> Option<Args> {
         channel,
         listen,
         interval_ms,
+        https,
     })
 }
 
@@ -195,7 +202,7 @@ fn main() {
         args.listen
     );
 
-    let api = HikvisionAPI::new(&args.host, args.port, &args.user, &args.password);
+    let api = HikvisionAPI::new(&args.host, args.port, &args.user, &args.password, args.https);
 
     // Quick connectivity test
     match api.device_info() {

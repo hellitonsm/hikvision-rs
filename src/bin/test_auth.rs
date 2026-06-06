@@ -11,8 +11,9 @@ fn main() {
         .unwrap_or(80);
     let user = env::var("USER").unwrap_or_else(|_| "admin".into());
     let pass = env::var("PASS").unwrap_or_else(|_| "".into());
+    let use_https = env::var("HTTPS").map(|v| v == "1" || v == "true").unwrap_or(false);
 
-    let api = HikvisionAPI::new(&host, port, &user, &pass);
+    let api = HikvisionAPI::new(&host, port, &user, &pass, use_https);
     match api.device_info() {
         Ok(info) => println!("OK: {} | {} | {}", info.name, info.model, info.firmware),
         Err(e) => eprintln!("ERR: {}", e),

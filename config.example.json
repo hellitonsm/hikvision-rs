@@ -8,6 +8,7 @@
   "verification_code": "",
   "library_path": "",
   "use_substream": false,
+  "use_https": false,
   "stream_method": "Snapshot",
   "snapshot_interval": 300
 }

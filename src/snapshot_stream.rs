@@ -13,12 +13,13 @@ pub fn snapshot_stream_loop(
     port: u16,
     user: &str,
     password: &str,
+    use_https: bool,
     tx: SyncSender<RtspFrame>,
     stop: Arc<AtomicBool>,
     repaint: egui::Context,
     interval_ms: u64,
 ) {
-    let api = HikvisionAPI::new(host, port, user, password);
+    let api = HikvisionAPI::new(host, port, user, password, use_https);
     let mut frame_count = 0u64;
     let mut fps_timer = Instant::now();
 

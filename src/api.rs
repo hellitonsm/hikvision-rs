@@ -102,7 +102,7 @@ pub struct DeviceInfo {
 /// ```no_run
 /// use hikvision_rs::api::HikvisionAPI;
 ///
-/// let api = HikvisionAPI::new("192.168.1.100", 80, "admin", "senha123");
+/// let api = HikvisionAPI::new("192.168.1.100", 80, "admin", "senha123", false);
 /// match api.device_info() {
 ///     Ok(info) => println!("Conectado: {} ({})", info.name, info.model),
 ///     Err(e) => eprintln!("Falha na autenticação: {}", e),
@@ -133,18 +133,35 @@ impl HikvisionAPI {
     /// * `port` — Porta HTTP (padrão Hikvision: `80`).
     /// * `user` — Nome de usuário para autenticação.
     /// * `password` — Senha do usuário.
+    /// * `use_https` — Se `true`, usa HTTPS e aceita certificado auto-assinado da câmera.
     ///
     /// O `ureq::Agent` é configurado com `http_status_as_error(false)` para que
     /// respostas 401 possam ser inspecionadas manualmente durante o handshake Digest.
-    pub fn new(host: &str, port: u16, user: &str, password: &str) -> Self {
+    /// Quando `use_https` é ativado, a verificação do certificado TLS é desabilitada
+    /// para aceitar certificados auto-assinados.
+    pub fn new(host: &str, port: u16, user: &str, password: &str, use_https: bool) -> Self {
+        let tls_config = if use_https {
+            ureq::tls::TlsConfig::builder()
+                .disable_verification(true)
+                .build()
+        } else {
+            ureq::tls::TlsConfig::default()
+        };
         let agent = ureq::Agent::new_with_config(
             ureq::config::Config::builder()
                 .http_status_as_error(false)
+                .tls_config(tls_config)
+                .timeout_global(Some(std::time::Duration::from_secs(15)))
                 .build(),
         );
         Self {
             agent,
-            base: format!("http://{}:{}", host, port),
+            base: format!(
+                "{}://{}:{}",
+                if use_https { "https" } else { "http" },
+                host,
+                port
+            ),
             user: user.to_string(),
             password: password.to_string(),
             auth_header: RefCell::new(None),
