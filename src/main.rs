@@ -323,6 +323,9 @@ struct HikvisionApp {
     /// Canais que precisam iniciar stream X11 mas a janela ainda não existia.
     /// Resolvido em try_start_pending_x11_streams() após ensure_window.
     x11_pending: Vec<usize>,
+    /// Mapeia slot do grid (0..capacity) -> índice em channels[].
+    /// Ex: grid_slots[0] = Some(4) significa que a câmera channels[4] aparece no slot 0.
+    grid_slots: Vec<Option<usize>>,
 }
 
 impl Default for HikvisionApp {
@@ -357,6 +360,7 @@ impl Default for HikvisionApp {
             x11_main_xid: None,
             x11_window_xid_obtained: false,
             x11_pending: Vec::new(),
+            grid_slots: Vec::new(),
         }
     }
 }
@@ -515,6 +519,7 @@ impl HikvisionApp {
                         } else {
                             Some(0)
                         };
+                        self.grid_slots = vec![None; self.layout_mode.capacity()];
                         self.api = Some(api);
                         self.error = None;
 
@@ -793,9 +798,11 @@ impl HikvisionApp {
                 if let Some(ref mut multi) = self.hcnetsdk_x11_multi {
                     multi.stop_channel(sdk_channel);
                 }
-                // Remove a janela X11 filha
+                // Remove a janela X11 filha pelo slot onde este canal está alocado
                 if let Some(ref mut mgr) = self.x11_manager {
-                    mgr.remove_window(channel_index);
+                    if let Some(slot) = self.grid_slots.iter().position(|s| *s == Some(channel_index)) {
+                        mgr.remove_window(slot);
+                    }
                 }
                 // Remove dos pendentes
                 self.x11_pending.retain(|&i| i != channel_index);
@@ -842,6 +849,10 @@ impl HikvisionApp {
 
     fn stop_all_streams(&mut self) {
         if self.stream_method == StreamMethod::HCNetSDK_X11 {
+            // Limpar grid_slots
+            for slot in &mut self.grid_slots {
+                *slot = None;
+            }
             // Stop all SDK streams (logout via Drop)
             self.hcnetsdk_x11_multi = None;
             // Destroy all X11 overlay windows completely
@@ -859,6 +870,9 @@ impl HikvisionApp {
         }
 
         if self.stream_method == StreamMethod::HCNetSDK {
+            for slot in &mut self.grid_slots {
+                *slot = None;
+            }
             if let Some(ref mut multi) = self.hcnetsdk_multi.take() {
                 multi.stop_all();
             }
@@ -871,6 +885,9 @@ impl HikvisionApp {
                 state.frame_height = 0;
             }
             return;
+        }
+        for slot in &mut self.grid_slots {
+            *slot = None;
         }
         for i in 0..self.streams.len() {
             self.stop_stream(i);
@@ -887,31 +904,38 @@ impl HikvisionApp {
             return;
         }
 
+        let is_multi = matches!(self.layout_mode, LayoutMode::Grid2x2 | LayoutMode::Grid3x3 | LayoutMode::Grid4x4);
+
         let mut still_pending = Vec::new();
         for &idx in &self.x11_pending {
             if idx >= self.channels.len() {
                 continue;
             }
             let channel_id = &self.channels[idx].id;
-                    let sdk_channel = self.sdk_channel_for(channel_id);
+            let sdk_channel = self.sdk_channel_for(channel_id);
 
-                    // Já está ativo? Remove dos pendentes.
-                    if self.hcnetsdk_x11_multi.as_ref().map(|m| m.is_channel_active(sdk_channel)).unwrap_or(false) {
-                        log::info!("X11 pending: channel {} already active, removing from pending", sdk_channel);
-                        continue;
-                    }
+            // Já está ativo? Remove dos pendentes.
+            if self.hcnetsdk_x11_multi.as_ref().map(|m| m.is_channel_active(sdk_channel)).unwrap_or(false) {
+                log::info!("X11 pending: channel {} already active, removing from pending", sdk_channel);
+                continue;
+            }
 
-                    // Verifica se a janela X11 existe
-                    let is_zero_ch = channel_id == "001" || channel_id == "1" || channel_id == "0";
-                    let win_id = self.x11_manager.as_ref().and_then(|mgr| mgr.window_id(idx));
-                    match win_id {
-                        Some(win_id) => {
-                            let force_sub = matches!(
-                                self.layout_mode,
-                                LayoutMode::Grid2x2 | LayoutMode::Grid3x3 | LayoutMode::Grid4x4
-                            ) && !is_zero_ch;
-                            let multi = self.hcnetsdk_x11_multi.as_mut().unwrap();
-                            match multi.start_channel(sdk_channel, !force_sub, win_id) {
+            // Verifica se a janela X11 existe
+            let is_zero_ch = channel_id == "001" || channel_id == "1" || channel_id == "0";
+
+            // Em modo multi-view, encontrar o slot que contém este canal
+            let win_id = if is_multi {
+                self.grid_slots.iter().position(|s| *s == Some(idx))
+                    .and_then(|slot| self.x11_manager.as_ref().and_then(|mgr| mgr.window_id(slot)))
+            } else {
+                self.x11_manager.as_ref().and_then(|mgr| mgr.window_id(idx))
+            };
+
+            match win_id {
+                Some(win_id) => {
+                    let force_sub = is_multi && !is_zero_ch;
+                    let multi = self.hcnetsdk_x11_multi.as_mut().unwrap();
+                    match multi.start_channel(sdk_channel, !force_sub, win_id) {
                         Ok(()) => {
                             log::info!("X11 pending: channel {} started on window 0x{:x}", sdk_channel, win_id);
                         }
@@ -922,7 +946,7 @@ impl HikvisionApp {
                     }
                 }
                 None => {
-                    // Janela ainda não existe, manter pendente
+                    // Janela ainda não existe ou canal não está em slot, manter pendente
                     still_pending.push(idx);
                 }
             }
@@ -1095,11 +1119,25 @@ impl HikvisionApp {
         if self.layout_mode != self.prev_layout {
             self.prev_layout = self.layout_mode;
 
+            // Reconstruir grid_slots para o novo layout
+            let new_cap = self.layout_mode.capacity();
+            let old_slots = std::mem::replace(&mut self.grid_slots, vec![None; new_cap]);
+            let mut active_channels: Vec<usize> = old_slots.iter().filter_map(|s| *s).collect();
+            // Incluir canais ativos que não estavam em slots (ex: modo Single)
+            for i in 0..self.channels.len() {
+                if self.channel_is_active(i) && !active_channels.contains(&i) {
+                    active_channels.push(i);
+                }
+            }
+
+            // Re-assign canais ativos aos novos slots na ordem
+            for (i, ch_idx) in active_channels.iter().enumerate() {
+                if i < new_cap {
+                    self.grid_slots[i] = Some(*ch_idx);
+                }
+            }
+
             if self.stream_method.is_x11_overlay() {
-                // Salvar quais canais estavam ativos ANTES de destruir
-                let active_channels: Vec<usize> = (0..self.channels.len())
-                    .filter(|&i| self.channel_is_active(i))
-                    .collect();
                 log::info!("Layout change: {} active channels to re-start", active_channels.len());
 
                 // Destruir tudo e reconstruir limpo
@@ -1121,16 +1159,14 @@ impl HikvisionApp {
                 }
 
                 // Re-iniciar canais que estavam ativos
-                for i in active_channels {
-                    log::info!("Layout change: re-starting channel index {}", i);
-                    self.start_stream(i, ctx);
+                for ch_idx in active_channels {
+                    log::info!("Layout change: re-starting channel index {}", ch_idx);
+                    self.start_stream(ch_idx, ctx);
                 }
             } else {
-                for i in 0..self.streams.len() {
-                    if self.channel_is_active(i) {
-                        self.stop_stream(i);
-                        self.start_stream(i, ctx);
-                    }
+                for ch_idx in active_channels {
+                    self.stop_stream(ch_idx);
+                    self.start_stream(ch_idx, ctx);
                 }
             }
         }
@@ -1225,13 +1261,17 @@ impl HikvisionApp {
                         }
                         _ => {
                             for (i, ch) in channels.iter().enumerate() {
-                                let is_on = self.channel_is_active(i);
-                                let mut checked = is_on;
+                                let is_assigned = self.grid_slots.iter().any(|s| *s == Some(i));
+                                let mut checked = is_assigned;
                                 let label = format!("[{}] {}", ch.id, ch.name);
                                 if ui.checkbox(&mut checked, &label).changed() {
                                     if checked {
-                                        self.start_stream(i, ctx);
-                                    } else {
+                                        if let Some(empty) = self.grid_slots.iter().position(|s| s.is_none()) {
+                                            self.grid_slots[empty] = Some(i);
+                                            self.start_stream(i, ctx);
+                                        }
+                                    } else if let Some(slot) = self.grid_slots.iter().position(|s| *s == Some(i)) {
+                                        self.grid_slots[slot] = None;
                                         self.stop_stream(i);
                                     }
                                 }
@@ -1239,14 +1279,26 @@ impl HikvisionApp {
                             ui.separator();
                             if ui.button("Start All").clicked() {
                                 let cap = self.layout_mode.capacity();
-                                for i in 0..self.streams.len().min(cap) {
-                                    if !self.channel_is_active(i) {
-                                        self.start_stream(i, ctx);
+                                let empty_slots: Vec<usize> = (0..cap)
+                                    .filter(|s| self.grid_slots.get(*s).map_or(true, |v| v.is_none()))
+                                    .collect();
+                                let mut next = 0;
+                                for i in 0..self.channels.len().min(cap) {
+                                    if !self.grid_slots.iter().any(|s| *s == Some(i)) {
+                                        if next < empty_slots.len() {
+                                            self.grid_slots[empty_slots[next]] = Some(i);
+                                            self.start_stream(i, ctx);
+                                            next += 1;
+                                        }
                                     }
                                 }
                             }
                             if ui.button("Stop All").clicked() {
-                                self.stop_all_streams();
+                                for slot in 0..self.grid_slots.len() {
+                                    if let Some(ch_idx) = self.grid_slots[slot].take() {
+                                        self.stop_stream(ch_idx);
+                                    }
+                                }
                             }
                         }
                     }
@@ -1367,28 +1419,30 @@ impl HikvisionApp {
         for row in 0..self.layout_mode.rows() {
             ui.horizontal(|ui| {
                 for col in 0..self.layout_mode.cols() {
-                    let idx = row * self.layout_mode.cols() + col;
+                    let slot = row * self.layout_mode.cols() + col;
                     let (rect, _response) = ui.allocate_exact_size(cell_size, egui::Sense::click());
 
                     if is_x11 {
-                        // Modo X11: sincronizar janela overlay com a posição da célula
+                        // Modo X11: sincronizar janela overlay com a posição do slot
                         if let Some(ref mut mgr) = self.x11_manager {
-                            mgr.ensure_window(idx, rect.min.x, rect.min.y, cell_size.x, cell_size.y);
+                            mgr.ensure_window(slot, rect.min.x, rect.min.y, cell_size.x, cell_size.y);
                         }
                     }
+
+                    let channel_idx = self.grid_slots.get(slot).copied().flatten();
 
                     let mut cell_ui = ui.new_child(
                         egui::UiBuilder::new()
                             .max_rect(rect)
                             .layout(egui::Layout::top_down(egui::Align::Center)),
                     );
-                    self.render_cell(&mut cell_ui, idx, cell_size);
+                    self.render_cell(&mut cell_ui, slot, channel_idx, cell_size);
                 }
             });
         }
     }
 
-    fn render_cell(&self, ui: &mut egui::Ui, idx: usize, cell_size: egui::Vec2) {
+    fn render_cell(&self, ui: &mut egui::Ui, _slot: usize, channel_idx: Option<usize>, cell_size: egui::Vec2) {
         // Dark background
         ui.painter().rect_filled(
             ui.max_rect(),
@@ -1396,22 +1450,21 @@ impl HikvisionApp {
             egui::Color32::from_rgb(10, 10, 10),
         );
 
-        if idx >= self.channels.len() {
-            ui.add_space(cell_size.y * 0.4);
-            ui.colored_label(egui::Color32::DARK_GRAY, "No Signal");
-            return;
-        }
-
-        let channel_name = if idx < self.channels.len() {
-            format!("[{}]", self.channels[idx].id)
-        } else {
-            format!("Ch {}", idx + 1)
+        let ch_idx = match channel_idx {
+            Some(ci) if ci < self.channels.len() => ci,
+            _ => {
+                ui.add_space(cell_size.y * 0.4);
+                ui.colored_label(egui::Color32::DARK_GRAY, "No Signal");
+                return;
+            }
         };
+
+        let channel_name = format!("[{}]", self.channels[ch_idx].id);
 
         // Modo X11 overlay: o SDK renderiza direto na janela X11.
         // Não desenhamos textura via egui — apenas mostramos o label.
         if self.stream_method.is_x11_overlay() {
-            let is_active = self.channel_is_active(idx);
+            let is_active = self.channel_is_active(ch_idx);
             ui.add_space(cell_size.y * 0.35);
             ui.colored_label(egui::Color32::WHITE, &channel_name);
             if is_active {
@@ -1423,13 +1476,13 @@ impl HikvisionApp {
         }
 
         // Modos baseados em texture (RTSP, Snapshot, PlayCtrl, HCNetSDK callback)
-        if idx >= self.streams.len() {
+        if ch_idx >= self.streams.len() {
             ui.add_space(cell_size.y * 0.4);
             ui.colored_label(egui::Color32::DARK_GRAY, &channel_name);
             return;
         }
 
-        let state = &self.streams[idx];
+        let state = &self.streams[ch_idx];
 
         if let Some(ref tex) = state.texture {
             let label_h = 18.0;
@@ -1470,7 +1523,7 @@ impl HikvisionApp {
         } else {
             ui.add_space(cell_size.y * 0.35);
             ui.colored_label(egui::Color32::GRAY, &channel_name);
-            if idx < self.streams.len() && (self.streams[idx].stream_handle.is_some() || self.streams[idx].frame_rx.is_some()) {
+            if ch_idx < self.streams.len() && (self.streams[ch_idx].stream_handle.is_some() || self.streams[ch_idx].frame_rx.is_some()) {
                 ui.colored_label(egui::Color32::DARK_GRAY, "Aguardando...");
             } else {
                 ui.colored_label(egui::Color32::DARK_GRAY, "Sem Sinal");
