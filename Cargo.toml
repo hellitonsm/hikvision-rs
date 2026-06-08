@@ -19,6 +19,8 @@ jpeg-decoder = "0.3"
 
 tungstenite = "0.26"
 sha2 = "0.10"
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
+rustls-pki-types = "1"
 aes = "0.8"
 cbc = "0.1"
 serde = { version = "1", features = ["derive"] }

@@ -1,4 +1,4 @@
-use hikvision_rs::api::{Channel, HikvisionAPI};
+use hikvision_rs::api::{check_tls_fingerprint, Channel, FingerprintCheck, HikvisionAPI};
 use hikvision_rs::hcnetsdk;
 use hikvision_rs::hcnetsdk_x11_multi;
 use hikvision_rs::playctrl_stream;
@@ -21,7 +21,6 @@ enum StreamMethod {
     Rtsp,
     Snapshot,
     PlayCtrl,
-    ZeroChannel,
     HCNetSDK,
     #[allow(non_camel_case_types)]
     HCNetSDK_X11,
@@ -33,14 +32,13 @@ impl StreamMethod {
             StreamMethod::Rtsp => "RTSP (direto)",
             StreamMethod::Snapshot => "Snapshot (JPEG polling)",
             StreamMethod::PlayCtrl => "PlayCtrl (descriptografia)",
-            StreamMethod::ZeroChannel => "Canal Zero (stream multiplexado)",
             StreamMethod::HCNetSDK => "HCNetSDK (callback + PlayM4)",
             StreamMethod::HCNetSDK_X11 => "HCNetSDK X11 (overlay direto)",
         }
     }
 
     fn needs_verification_code(&self) -> bool {
-        matches!(self, StreamMethod::PlayCtrl | StreamMethod::ZeroChannel | StreamMethod::HCNetSDK | StreamMethod::HCNetSDK_X11)
+        matches!(self, StreamMethod::PlayCtrl | StreamMethod::HCNetSDK | StreamMethod::HCNetSDK_X11)
     }
 
     fn needs_sdk_library(&self) -> bool {
@@ -121,6 +119,8 @@ struct Config {
     use_https: bool,
     stream_method: StreamMethod,
     snapshot_interval: u64,
+    #[serde(default)]
+    cert_fingerprint: Option<String>,
 }
 
 impl Default for Config {
@@ -138,6 +138,7 @@ impl Default for Config {
             use_https: false,
             stream_method: StreamMethod::Snapshot,
             snapshot_interval: 300,
+            cert_fingerprint: None,
         }
     }
 }
@@ -167,7 +168,6 @@ impl Config {
                         use_substream: Option<bool>,
                         use_snapshot: Option<bool>,
                         use_playctrl: Option<bool>,
-                        use_zero_channel: Option<bool>,
                         use_hcnetsdk: Option<bool>,
                         snapshot_interval: Option<u64>,
                     }
@@ -175,8 +175,6 @@ impl Config {
                         log::info!("Migrating config from old format");
                         let stream_method = if old.use_hcnetsdk.unwrap_or(false) {
                             StreamMethod::HCNetSDK
-                        } else if old.use_zero_channel.unwrap_or(false) {
-                            StreamMethod::ZeroChannel
                         } else if old.use_playctrl.unwrap_or(false) {
                             StreamMethod::PlayCtrl
                         } else if old.use_snapshot.unwrap_or(true) {
@@ -197,6 +195,7 @@ impl Config {
                             use_https: false,
                             stream_method,
                             snapshot_interval: old.snapshot_interval.unwrap_or(300),
+                            cert_fingerprint: None,
                         };
                         return cfg;
                     }
@@ -239,6 +238,7 @@ impl Config {
         app.use_https = self.use_https;
         app.stream_method = self.stream_method;
         app.snapshot_interval = self.snapshot_interval;
+        app.cert_fingerprint = self.cert_fingerprint.clone();
     }
 
     fn from_app(app: &HikvisionApp) -> Self {
@@ -255,6 +255,7 @@ impl Config {
             use_https: app.use_https,
             stream_method: app.stream_method,
             snapshot_interval: app.snapshot_interval,
+            cert_fingerprint: app.cert_fingerprint.clone(),
         }
     }
 }
@@ -304,11 +305,9 @@ struct HikvisionApp {
     api: Option<HikvisionAPI>,
     channels: Vec<Channel>,
     device_name: String,
-    device_supports_zero_channel: bool,
-    zero_channel_enabled: Option<bool>,
-    /// SDK channel number base for Canal Zero: byStartChan + byChanNum + byIPChanNum.
-    zero_ch_base: Option<i32>,
     error: Option<String>,
+    cert_fingerprint: Option<String>,
+    pending_new_fingerprint: Option<String>,
 
     layout_mode: LayoutMode,
     prev_layout: LayoutMode,
@@ -346,10 +345,9 @@ impl Default for HikvisionApp {
             api: None,
             channels: Vec::new(),
             device_name: String::new(),
-            device_supports_zero_channel: false,
-            zero_channel_enabled: None,
-            zero_ch_base: None,
             error: None,
+            cert_fingerprint: None,
+            pending_new_fingerprint: None,
             layout_mode: LayoutMode::Single,
             prev_layout: LayoutMode::Single,
             streams: Vec::new(),
@@ -388,103 +386,38 @@ impl HikvisionApp {
             return;
         }
 
+        if self.use_https {
+            let stored = self.cert_fingerprint.as_deref();
+            match check_tls_fingerprint(&host, port, stored) {
+                Ok(FingerprintCheck::Match) => {}
+                Ok(FingerprintCheck::New(fp)) => {
+                    self.pending_new_fingerprint = Some(fp.clone());
+                    self.error = Some(format!(
+                        "Primeira conexão HTTPS.\nFingerprint do certificado:\n{}\n\nConfie neste certificado?",
+                        fp
+                    ));
+                    return;
+                }
+                Ok(FingerprintCheck::Mismatch(old, new)) => {
+                    self.pending_new_fingerprint = Some(new);
+                    self.error = Some(format!(
+                        "Certificate fingerprint changed!\nOld: {}\nNew: {}\nAccept the new fingerprint to proceed.",
+                        old, self.pending_new_fingerprint.as_ref().unwrap()
+                    ));
+                    return;
+                }
+                Err(e) => {
+                    self.error = Some(format!("Certificate fingerprint check failed: {}", e));
+                    return;
+                }
+            }
+        }
+
         let api = HikvisionAPI::new(&host, port, &user, &password, self.use_https);
         match api.device_info() {
             Ok(info) => {
                 self.device_name =
                     format!("{} | {} | {}", info.name, info.model, info.firmware);
-                self.device_supports_zero_channel = info.zero_chan_num > 0;
-
-                // Para modos SDK, sondar byZeroChanNum via login SDK
-                // (mais confiável que ISAPI para alguns dispositivos)
-                if self.stream_method == StreamMethod::HCNetSDK
-                    || self.stream_method == StreamMethod::HCNetSDK_X11
-                {
-                    let sdk_port: u16 = self.sdk_port.trim().parse().unwrap_or(8000);
-                    log::info!("Probing SDK for Canal Zero support & channel base");
-                    if let Some(sdk) = hcnetsdk::try_global_sdk() {
-                        match sdk.login(&host, sdk_port, &user, &password) {
-                            Ok((uid, dev_info)) => {
-                                let v30 = dev_info.struDeviceV30;
-                                let sdk_zero = v30.byZeroChanNum;
-                                if sdk_zero > 0 {
-                                    log::info!("SDK reports byZeroChanNum={} — Canal Zero suportado", sdk_zero);
-                                    self.device_supports_zero_channel = true;
-
-                                    // Verificar/ativar Canal Zero via SDK
-                                    match sdk.ensure_zero_channel_enabled(uid, true) {
-                                        Ok((enabled, was_enabled)) => {
-                                            if enabled {
-                                                self.zero_channel_enabled = Some(true);
-                                                if was_enabled {
-                                                    log::info!("Canal Zero ativado via SDK (estava desabilitado)");
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            log::warn!("Failed to check/enable Canal Zero via SDK: {}", e);
-                                        }
-                                    }
-                                } else {
-                                    log::info!("SDK reports byZeroChanNum=0 — Canal Zero não suportado via SDK");
-                                }
-                                let base = v30.byStartChan as i32
-                                    + v30.byChanNum as i32
-                                    + v30.byIPChanNum as i32;
-                                log::info!(
-                                    "SDK channel base: byStartChan={} + byChanNum={} + byIPChanNum={} = {}",
-                                    v30.byStartChan, v30.byChanNum, v30.byIPChanNum, base
-                                );
-                                self.zero_ch_base = Some(base);
-                                let _ = sdk.logout(uid);
-                            }
-                            Err(e) => {
-                                log::warn!("SDK login probe failed: {} — using ISAPI value", e);
-                            }
-                        }
-                    } else {
-                        log::warn!("HCNetSDK not initialized, skipping SDK Canal Zero probe");
-                    }
-                }
-
-                // Para modos SDK, sempre oferecer Canal Zero na lista se suportado.
-                // Se ISAPI e SDK não detectaram, incluir mesmo assim — o SDK
-                // reportará erro 953 (NET_ERR_NO_ZERO_CHAN) ao tentar iniciar.
-                let offer_zero_ch = self.stream_method == StreamMethod::ZeroChannel
-                    || self.stream_method == StreamMethod::HCNetSDK
-                    || self.stream_method == StreamMethod::HCNetSDK_X11;
-
-                if self.stream_method == StreamMethod::ZeroChannel && !self.device_supports_zero_channel {
-                    log::warn!("Canal Zero solicitado mas dispositivo não suporta (zeroChanNum={})", info.zero_chan_num);
-                    self.error = Some("Dispositivo não suporta Canal Zero. Desative a opção ou ative no DVR.".into());
-                    return;
-                }
-
-                if self.device_supports_zero_channel {
-                    log::info!("Dispositivo suporta Canal Zero (zeroChanNum={})", info.zero_chan_num);
-
-                    // Check if Canal Zero is actually enabled
-                    match api.zero_channel_enabled() {
-                        Ok(true) => {
-                            log::info!("Canal Zero está ativado no dispositivo");
-                            self.zero_channel_enabled = Some(true);
-                        }
-                        Ok(false) => {
-                            log::warn!("Canal Zero suportado mas NÃO ativado nas configurações do DVR");
-                            self.zero_channel_enabled = Some(false);
-                            if self.stream_method == StreamMethod::ZeroChannel {
-                                self.error = Some("Canal Zero não está ativado. Ative em: DVR > Configurações > Visualização > Canal Zero".into());
-                                return;
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!("Não foi possível verificar se Canal Zero está ativado: {}", e);
-                            self.zero_channel_enabled = None;
-                        }
-                    }
-                } else {
-                    self.zero_channel_enabled = None;
-                }
 
                 match api.channels() {
                     Ok(chs) => {
@@ -497,17 +430,6 @@ impl HikvisionApp {
                                 if deduped.len() >= 17 {
                                     break;
                                 }
-                            }
-                        }
-                        if offer_zero_ch && !deduped.iter().any(|c| c.id == "001") {
-                            let include = self.device_supports_zero_channel
-                                || self.stream_method == StreamMethod::HCNetSDK
-                                || self.stream_method == StreamMethod::HCNetSDK_X11;
-                            if include {
-                                deduped.insert(0, Channel {
-                                    id: "001".to_string(),
-                                    name: "Canal Zero".to_string(),
-                                });
                             }
                         }
                         self.channels = deduped;
@@ -533,14 +455,7 @@ impl HikvisionApp {
     }
 
     fn rtsp_url(&self, channel_id: &str, force_substream: bool) -> String {
-        let cid = if channel_id == "1" || channel_id == "0" || channel_id == "001" {
-            // Canal Zero: tentar múltiplos IDs dependendo do modelo do NVR
-            // Alguns modelos usam "0", outros "001", outros "1"
-            if self.device_supports_zero_channel {
-                log::info!("Canal Zero detectado: usando ID '{}' para RTSP", channel_id);
-            }
-            channel_id.to_string()
-        } else if self.use_substream || force_substream {
+        let cid = if self.use_substream || force_substream {
             if channel_id.ends_with('1') {
                 let mut s = channel_id[..channel_id.len() - 1].to_string();
                 s.push('2');
@@ -594,15 +509,8 @@ impl HikvisionApp {
     }
 
     /// Compute the SDK channel number for NET_DVR_PREVIEWINFO.lChannel.
-    /// For Canal Zero: lChannel=1 (virtual channel index for zero channel).
-    /// For normal channels: lChannel=channel_id/100.
     fn sdk_channel_for(&self, channel_id: &str) -> i32 {
-        let is_zero_ch = channel_id == "001" || channel_id == "1" || channel_id == "0";
-        if is_zero_ch {
-            1
-        } else {
-            channel_id.trim().parse::<i32>().unwrap_or(100) / 100
-        }
+        channel_id.trim().parse::<i32>().unwrap_or(100) / 100
     }
 
     fn start_stream(&mut self, channel_index: usize, ctx: &egui::Context) {
@@ -615,11 +523,10 @@ impl HikvisionApp {
 
         let channel_id = self.channels[channel_index].id.clone();
         let channel_name = self.channels[channel_index].name.clone();
-        let is_zero_ch = channel_id == "001" || channel_id == "1" || channel_id == "0";
         let force_sub = matches!(
             self.layout_mode,
             LayoutMode::Grid2x2 | LayoutMode::Grid3x3 | LayoutMode::Grid4x4
-        ) && !is_zero_ch;
+        );
 
         let host = self.host.trim().to_string();
         let port: u16 = self.port.trim().parse().unwrap_or(80);
@@ -649,23 +556,6 @@ impl HikvisionApp {
         state.fps = 0.0;
 
         match method {
-            StreamMethod::ZeroChannel => {
-                log::info!("Starting zero-channel stream (FFmpeg+decrypt) for {}: {}", channel_id, channel_name);
-                if verification_code.trim().is_empty() {
-                    log::error!("Canal Zero requer Verification Code para descriptografia");
-                    self.error = Some("Canal Zero requer Verification Code para descriptografia AES. Preencha o campo na configuração.".into());
-                    return;
-                }
-                let cid = channel_id.clone();
-                let handle = thread::spawn(move || {
-                    playctrl_stream::zero_channel_stream_loop(
-                        &host, rtsp_port, &cid, &user, &password,
-                        &verification_code,
-                        tx, stop, repaint_ctx,
-                    );
-                });
-                state.stream_handle = Some(handle);
-            }
             StreamMethod::Snapshot => {
                 log::info!("Starting snapshot stream for channel {}: {}", channel_id, channel_name);
                 let cid = channel_id.clone();
@@ -677,12 +567,8 @@ impl HikvisionApp {
                 state.stream_handle = Some(handle);
             }
             StreamMethod::HCNetSDK => {
-                let main_stream = !force_sub || is_zero_ch;
-                if is_zero_ch {
-                    log::info!("Starting HCNetSDK callback stream — Canal Zero (sdk_channel={})", sdk_channel);
-                } else {
-                    log::info!("Starting HCNetSDK callback stream ch {} (sdk={})", channel_id, sdk_channel);
-                }
+                let main_stream = !force_sub;
+                log::info!("Starting HCNetSDK callback stream ch {} (sdk={})", channel_id, sdk_channel);
 
                 let vc = if verification_code.is_empty() {
                     None
@@ -723,11 +609,7 @@ impl HikvisionApp {
                 }
             }
             StreamMethod::HCNetSDK_X11 => {
-                if is_zero_ch {
-                    log::info!("Starting HCNetSDK X11 direct stream — Canal Zero (sdk_channel={})", sdk_channel);
-                } else {
-                    log::info!("Starting HCNetSDK X11 direct stream ch {} (sdk={})", channel_id, sdk_channel);
-                }
+                log::info!("Starting HCNetSDK X11 direct stream ch {} (sdk={})", channel_id, sdk_channel);
 
                 if self.x11_main_xid.is_some() {
                     let vc = if verification_code.is_empty() {
@@ -920,9 +802,6 @@ impl HikvisionApp {
                 continue;
             }
 
-            // Verifica se a janela X11 existe
-            let is_zero_ch = channel_id == "001" || channel_id == "1" || channel_id == "0";
-
             // Em modo multi-view, encontrar o slot que contém este canal
             let win_id = if is_multi {
                 self.grid_slots.iter().position(|s| *s == Some(idx))
@@ -933,7 +812,7 @@ impl HikvisionApp {
 
             match win_id {
                 Some(win_id) => {
-                    let force_sub = is_multi && !is_zero_ch;
+                    let force_sub = is_multi;
                     let multi = self.hcnetsdk_x11_multi.as_mut().unwrap();
                     match multi.start_channel(sdk_channel, !force_sub, win_id) {
                         Ok(()) => {
@@ -1062,7 +941,6 @@ impl HikvisionApp {
                                 ui.selectable_value(&mut self.stream_method, StreamMethod::Rtsp, StreamMethod::Rtsp.label());
                                 ui.selectable_value(&mut self.stream_method, StreamMethod::Snapshot, StreamMethod::Snapshot.label());
                                 ui.selectable_value(&mut self.stream_method, StreamMethod::PlayCtrl, StreamMethod::PlayCtrl.label());
-                                ui.selectable_value(&mut self.stream_method, StreamMethod::ZeroChannel, StreamMethod::ZeroChannel.label());
                                 ui.selectable_value(&mut self.stream_method, StreamMethod::HCNetSDK, StreamMethod::HCNetSDK.label());
                                 ui.selectable_value(&mut self.stream_method, StreamMethod::HCNetSDK_X11, StreamMethod::HCNetSDK_X11.label());
                             });
@@ -1103,7 +981,6 @@ impl HikvisionApp {
                     StreamMethod::HCNetSDK_X11 => egui::RichText::new("🖥️ HCNetSDK X11 (overlay direto). SDK renderiza via X11 — sem decodificação manual. Requer libhcnetsdk.so.").small().color(egui::Color32::DARK_GREEN),
                     StreamMethod::PlayCtrl => egui::RichText::new("🔐 PlayCtrl com descriptografia. Requer libPlayCtrl.so e Verification Code do DVR.").small().color(egui::Color32::DARK_GREEN),
                     StreamMethod::Snapshot => egui::RichText::new("ℹ️ Snapshot JPEG polling. ~2-3 FPS. Não requer desativar criptografia.").small().color(egui::Color32::DARK_GRAY),
-                    StreamMethod::ZeroChannel => egui::RichText::new("🔀 Canal Zero (RTSP multiplexado + descriptografia AES via FFmpeg). Requer Verification Code.").small().color(egui::Color32::DARK_BLUE),
                     StreamMethod::Rtsp => egui::RichText::new("⚠️ RTSP direto. Se a 'Criptografia de Transmissão' estiver ativada no DVR, o vídeo não carregará.").small().color(egui::Color32::DARK_GRAY),
                 };
                 ui.label(status);
@@ -1113,6 +990,45 @@ impl HikvisionApp {
                 }
             });
         });
+
+        if let Some(ref new_fp) = self.pending_new_fingerprint.clone() {
+            let is_first = self.cert_fingerprint.is_none();
+            let title = if is_first { "Confirmar certificado" } else { "Fingerprint alterado" };
+            egui::Window::new(title)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    if is_first {
+                        ui.label("Primeira conexão HTTPS com este servidor.");
+                        ui.label("Verifique o fingerprint do certificado:");
+                    } else {
+                        ui.label("O certificado SSL do servidor mudou!");
+                        ui.label("Isso pode significar:");
+                        ui.label("  • O DVR foi reiniciado de fábrica");
+                        ui.label("  • O certificado foi regenerado");
+                        ui.add_space(6.0);
+                        if let Some(ref old_fp) = self.cert_fingerprint {
+                            ui.label(format!("Fingerprint antigo: {}", old_fp));
+                        }
+                    }
+                    ui.add_space(4.0);
+                    ui.label(format!("Fingerprint: {}", new_fp));
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("✓ Aceitar (salvar fingerprint)").clicked() {
+                            self.cert_fingerprint = Some(new_fp.clone());
+                            self.pending_new_fingerprint = None;
+                            self.error = None;
+                            self.connect();
+                        }
+                        if ui.button("✗ Rejeitar").clicked() {
+                            self.pending_new_fingerprint = None;
+                            self.error = Some("Conexão rejeitada".into());
+                        }
+                    });
+                });
+        }
     }
 
     fn show_viewer(&mut self, ctx: &egui::Context) {
@@ -1180,13 +1096,6 @@ impl HikvisionApp {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(&self.device_name);
-                if self.device_supports_zero_channel {
-                    match self.zero_channel_enabled {
-                        Some(true) => { ui.label(egui::RichText::new("🔀 Canal Zero OK").small().color(egui::Color32::GREEN)); }
-                        Some(false) => { ui.label(egui::RichText::new("🔀 Canal Zero DESATIVADO").small().color(egui::Color32::YELLOW)); }
-                        None => { ui.label(egui::RichText::new("🔀 Canal Zero suportado").small().color(egui::Color32::from_rgb(120, 120, 120))); }
-                    }
-                }
                 if self.streams.iter().any(|s| s.stream_handle.is_some() || s.frame_rx.is_some()) {
                     ui.separator();
                     let active = self.streams.iter().filter(|s| s.stream_handle.is_some() || s.frame_rx.is_some()).count();
@@ -1200,9 +1109,6 @@ impl HikvisionApp {
                         self.channels.clear();
                         self.streams.clear();
                         self.focused_channel = None;
-                        self.device_supports_zero_channel = false;
-                        self.zero_channel_enabled = None;
-                        self.zero_ch_base = None;
                     }
                 });
             });
@@ -1218,7 +1124,6 @@ impl HikvisionApp {
                     StreamMethod::HCNetSDK_X11 => egui::RichText::new("🖥️ HCNetSDK X11").small().color(egui::Color32::DARK_GREEN),
                     StreamMethod::PlayCtrl => egui::RichText::new("🔐 PlayCtrl").small().color(egui::Color32::DARK_GREEN),
                     StreamMethod::Snapshot => egui::RichText::new("📷 Snapshot JPEG").small().color(egui::Color32::GREEN),
-                    StreamMethod::ZeroChannel => egui::RichText::new("🔀 Canal Zero").small().color(egui::Color32::DARK_BLUE),
                     StreamMethod::Rtsp => egui::RichText::new("🎥 RTSP direto").small().color(egui::Color32::LIGHT_BLUE),
                 };
                 ui.label(method_label);
@@ -1389,7 +1294,6 @@ impl HikvisionApp {
                         StreamMethod::HCNetSDK_X11 => "HCNetSDK X11 (overlay mode)",
                         StreamMethod::PlayCtrl => "PlayCtrl decrypting...",
                         StreamMethod::Snapshot => "Polling snapshot...",
-                        StreamMethod::ZeroChannel => "Canal Zero decrypting...",
                         StreamMethod::Rtsp => "Connecting to RTSP stream...",
                     };
                     ui.label(loading_label);

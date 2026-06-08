@@ -45,8 +45,148 @@
 use anyhow::{Context, Result};
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use sha2::{Digest, Sha256};
 use std::cell::RefCell;
+use std::net::TcpStream;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use ureq;
+
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerifier, ServerCertVerified};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+
+/// Result of a TLS certificate fingerprint check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FingerprintCheck {
+    /// No fingerprint was stored; this is the server's fingerprint to save.
+    New(String),
+    /// Fingerprint matches the stored one.
+    Match,
+    /// Fingerprint changed. Contains (stored_hex, actual_hex).
+    Mismatch(String, String),
+}
+
+/// Connect to the server, retrieve its TLS certificate, compute its SHA-256
+/// fingerprint, and compare with an optionally stored fingerprint.
+///
+/// If `stored_fingerprint` is `None`, returns `FingerprintCheck::New(hex)`.
+/// If it matches, returns `FingerprintCheck::Match`.
+/// If it differs, returns `FingerprintCheck::Mismatch(old, new)`.
+pub fn check_tls_fingerprint(
+    host: &str,
+    port: u16,
+    stored_fingerprint: Option<&str>,
+) -> Result<FingerprintCheck> {
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let captured = Arc::new(Mutex::<Option<Vec<u8>>>::new(None));
+    let verifier = CapturingVerifier {
+        captured: captured.clone(),
+    };
+
+    let config = Arc::new(
+        rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|_| anyhow::anyhow!("TLS protocol versions not supported"))?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(verifier))
+            .with_no_client_auth(),
+    );
+
+    let host_static: &'static str = Box::leak(host.to_string().into_boxed_str());
+    let server_name = ServerName::try_from(host_static)
+        .map_err(|_| anyhow::anyhow!("invalid hostname: {}", host))?;
+
+    let mut conn = rustls::ClientConnection::new(config, server_name)
+        .map_err(|e| anyhow::anyhow!("TLS client init failed: {}", e))?;
+
+    let addr = format!("{}:{}", host, port);
+    let mut tcp = TcpStream::connect_timeout(
+        &addr
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid address: {}", addr))?,
+        Duration::from_secs(10),
+    )?;
+    tcp.set_read_timeout(Some(Duration::from_secs(5)))?;
+    tcp.set_write_timeout(Some(Duration::from_secs(5)))?;
+
+    conn.complete_io(&mut tcp)
+        .map_err(|e| anyhow::anyhow!("TLS handshake failed: {}", e))?;
+
+    while conn.is_handshaking() {
+        conn.complete_io(&mut tcp)
+            .map_err(|e| anyhow::anyhow!("TLS handshake completion failed: {}", e))?;
+    }
+
+    let cert_der = captured
+        .lock()
+        .unwrap()
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("No certificate received from server"))?;
+
+    let fingerprint = Sha256::digest(&cert_der);
+    let hex = fingerprint
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join(":");
+
+    match stored_fingerprint {
+        Some(stored) if stored == hex => Ok(FingerprintCheck::Match),
+        Some(stored) => Ok(FingerprintCheck::Mismatch(stored.to_string(), hex)),
+        None => Ok(FingerprintCheck::New(hex)),
+    }
+}
+
+#[derive(Debug)]
+struct CapturingVerifier {
+    captured: Arc<Mutex<Option<Vec<u8>>>>,
+}
+
+impl ServerCertVerifier for CapturingVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        *self.captured.lock().unwrap() = Some(end_entity.to_vec());
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ED25519,
+        ]
+    }
+}
 
 /// Representa um canal de vídeo do DVR.
 ///
