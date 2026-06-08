@@ -29,6 +29,67 @@ Visualizador RTSP para DVRs Hikvision com interface gráfica nativa (egui/eframe
 sudo apt install libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
 ```
 
+### Instalação para Windows (WSL2)
+
+Para compilar no Windows, recomenda-se usar WSL2 (Windows Subsystem for Linux):
+
+```powershell
+# 1. Instalar WSL2 (PowerShell como Administrador)
+wsl --install -d Ubuntu-22.04
+
+# 2. Instalar dependências no Ubuntu/WSL
+sudo apt update
+sudo apt install build-essential pkg-config libssl-dev
+sudo apt install libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
+
+# 3. Instalar Rust no WSL
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.cargo/env
+
+# 4. Clonar e compilar
+git clone https://github.com/helliton/hikvision-rs.git
+cd hikvision-rs
+cargo build --release
+
+# 5. Executar (via WSL)
+cargo run --release
+
+# 6. Para executar a versão compilada no Windows
+# Copie o binário para o Windows
+cp target/release/hikvision-rs.exe /mnt/c/Users/<seu_usuario>/
+
+# Ou use uma interface gráfica via WSL (requer X server)
+# Instale VcXsrv ou X410 no Windows, depois:
+export DISPLAY=:0
+cargo run --release
+```
+
+**Alternativa Windows Nativo**: O projeto pode ser adaptado para Windows usando `winapi` e `libavcodec` via vcpkg ou distribuição manual das DLLs do FFmpeg. Contribuições são bem-vindas!
+
+## Ajustes de Performance
+
+### Windows (WSL2)
+- A performance de decodificação de vídeo no WSL2 pode variar; para melhor performance:
+  - Use WSL2 com suporte a GPU (requer Windows 11 + driver WSLg)
+  - Aumente a memória do WSL2 no arquivo `.wslconfig`:
+    ```ini
+    [wsl2]
+    memory=4GB
+    processors=4
+    ```
+
+### Linux
+- Para sistemas com múltiplos núcleos, a decodificação FFmpeg pode ser otimizada:
+  ```bash
+  # Verificar número de threads disponíveis
+  nproc
+  ```
+- Para sistemas com GPU NVIDIA, considere usar VA-API ou NVDEC:
+  ```bash
+  # Instalar drivers NVIDIA e VA-API
+  sudo apt install nvidia-driver-535 libva2 vainfo
+  ```
+
 ### Bibliotecas do SDK Hikvision (para streams criptografados)
 
 Para usar os modos **PlayCtrl** ou **Canal Zero** com criptografia ativada, você precisa da biblioteca proprietária `libPlayCtrl.so` do SDK Hikvision.
@@ -118,12 +179,15 @@ cargo run --release
 ### Canal Zero (Channel Zero)
 - **Protocolo**: RTSP multiplexado com descriptografia manual
 - **FPS**: 25-30
+- **URL**: `rtsp://admin:<SENHA>@<DVR_IP>:554/Streaming/channels/001`
 - **Requisitos**: 
   - DVR com suporte a Canal Zero (verificado via `zeroChanNum` no deviceInfo)
   - Canal Zero ativado no DVR: Configurações > Visualização > Canal Zero
-  - Verification Code
+  - **Verification Code** para streams criptografados
+  - Senha **crua** (ex: `#minhaSenha`), **sem URL encoding** — o DVR não decodifica `%XX`
 - **Vantagens**: Visualiza múltiplas câmeras em um único stream (economia de banda)
 - **Uso**: Visualização em grid de múltiplas câmeras com menor consumo de banda
+- **Nota**: O Canal Zero multiplexado não é acessível via APIs convencionais; requer URL RTSP customizada para o canal 001/002
 
 ## Perfis de compilação
 
@@ -133,6 +197,10 @@ cargo build
 
 # Release com LTO
 cargo build --release
+
+# Para Windows (WSL2)
+cargo build --release
+# O binário estará em: target/release/hikvision-rs
 ```
 
 O perfil debug otimiza dependências (`opt-level = 2`) para melhor performance de decodificação sem sacrificar a experiência de desenvolvimento.
