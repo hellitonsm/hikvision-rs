@@ -2,7 +2,10 @@
 
 [![Licença: MIT](https://img.shields.io/badge/licença-MIT-blue.svg)](LICENSE)
 
-> **🌐 Idioma:** [English](README.md) · Português
+<p align="right">
+  <a href="README.md">🇺🇸 English</a> |
+  <a href="README.pt-BR.md">🇧🇷 Português</a>
+</p>
 
 Interface gráfica nativa Linux para visualização de streams de vídeo de
 DVRs/NVRs Hikvision. Suporta streams criptografados (Verification Code)

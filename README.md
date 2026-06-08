@@ -2,7 +2,10 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> **🌐 Language:** English · [Português](LEIAME.md)
+<p align="right">
+  <a href="README.md">🇺🇸 English</a> |
+  <a href="README.pt-BR.md">🇧🇷 Português</a>
+</p>
 
 Native Linux GUI for viewing Hikvision DVR/NVR video streams. Supports
 encrypted streams (Verification Code) via the Hikvision Device Network SDK,
