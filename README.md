@@ -102,23 +102,27 @@ Para usar os modos **PlayCtrl** ou **Canal Zero** com criptografia ativada, voc�
    ~/.local/share/hikvision/weblocalserver/files/bin/libPlayCtrl.so
    ```
 
-#### Instalação
+#### Instalação das bibliotecas
 
-Copie `libPlayCtrl.so` (e suas dependências Qt5) para um dos caminhos de busca:
+Copie `libPlayCtrl.so` para um dos caminhos de busca:
 
 ```bash
-# Opção 1: Diretório do projeto
+# Opção 1: Diretório do projeto (junto ao binário)
 mkdir -p hikvision-libs
 cp libPlayCtrl.so hikvision-libs/
 
-# Opção 2: Diretório de configuração do usuário
+# Opção 2: Diretório de configuração do usuário (RECOMENDADO)
+# Útil para não esquecer após reinstalar o aplicativo - as libs ficam
+# persistentes em ~/.config/hikvision-rs/
 mkdir -p ~/.config/hikvision-rs
 cp libPlayCtrl.so ~/.config/hikvision-rs/
 
-# Opção 3: Sistema
+# Opção 3: Sistema (requer sudo)
 sudo cp libPlayCtrl.so /usr/local/lib/
 sudo ldconfig
 ```
+
+> **Importante**: Se você instalou o aplicativo via `make install` e pretende usar PlayCtrl ou Canal Zero com criptografia, **não esqueça de copiar as bibliotecas do SDK Hikvision** para um dos diretórios acima. Sem elas, o modo PlayCtrl/Canal Zero não funcionará.
 
 #### Verificação
 
@@ -132,11 +136,22 @@ O aplicativo busca automaticamente a biblioteca nos seguintes locais (em ordem):
 
 Se não encontrar, você verá o erro: `libPlayCtrl.so not found in any search path.`
 
-## Compilação
+## Compilação e Instalação
 
 ```bash
-cargo build --release
+# Compilar
+make release
+# ou: cargo build --release
+
+# Instalar (requer sudo)
+sudo make install
+# Binário será instalado em: /usr/local/bin/hikvision-rs
+
+# Uninstall
+sudo make uninstall
 ```
+
+## Bibliotecas do SDK Hikvision (para streams criptografados)
 
 ## Uso
 
@@ -189,18 +204,4 @@ cargo run --release
 - **Uso**: Visualização em grid de múltiplas câmeras com menor consumo de banda
 - **Nota**: O Canal Zero multiplexado não é acessível via APIs convencionais; requer URL RTSP customizada para o canal 001/002
 
-## Perfis de compilação
 
-```bash
-# Debug com dependências otimizadas (recomendado para desenvolvimento)
-cargo build
-
-# Release com LTO
-cargo build --release
-
-# Para Windows (WSL2)
-cargo build --release
-# O binário estará em: target/release/hikvision-rs
-```
-
-O perfil debug otimiza dependências (`opt-level = 2`) para melhor performance de decodificação sem sacrificar a experiência de desenvolvimento.
