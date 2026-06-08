@@ -1,218 +1,117 @@
 # hikvision-rs
 
-Visualizador RTSP para DVRs Hikvision com interface gráfica nativa (egui/eframe).
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-## Funcionalidades
+Native Linux GUI for viewing Hikvision DVR/NVR video streams. Supports
+encrypted streams (Verification Code) via the Hikvision Device Network SDK,
+multi-camera grid layouts, and Canal Zero.
 
-- Conexão via API ISAPI (HTTP Digest Auth)
-- Listagem automática dos canais do DVR
-- **Múltiplos modos de streaming**:
-  - RTSP direto (H.264/H.265 via FFmpeg)
-  - Snapshot (polling JPEG via ISAPI - funciona com criptografia)
-  - PlayCtrl (descriptografia com libPlayCtrl.so)
-  - Canal Zero (stream multiplexado de múltiplas câmeras)
-- Seleção entre stream principal e sub-stream
-- **Visualização múltipla**: 1x1, 2x2, 3x3 e 4x4 (até 16 câmeras simultâneas)
-- Sub-stream automático em modo multi-view
-- Reconexão automática em caso de falha
-- Interface gráfica com exibição em tempo real e contador de FPS
+## Features
 
-## Dependências
+- **Multiple streaming methods:** RTSP (FFmpeg), Snapshot (JPEG polling),
+  PlayCtrl (SDK decryption), HCNetSDK (callback + PlayM4), HCNetSDK X11
+  (direct X11 overlay)
+- **Multi-camera layouts:** 1×1, 2×2, 3×3, 4×4 with auto sub-stream
+  switching
+- **Canal Zero (Channel Zero):** single RTSP mosaic stream from the DVR
+- **HTTPS with TLS fingerprint pinning** (SHA-256 certificate verification)
+- **Encrypted stream support** via AES-256-CBC + Hikvision SDK
+- **Internationalization:** English and Portuguese
+- **Persistent config** in `~/.config/hikvision-rs/config.json`
 
-- [FFmpeg](https://ffmpeg.org/) (libavformat, libavcodec, libavutil, libswscale)
-- Rust 2021 edition
-- **Para descriptografia**: bibliotecas do SDK Hikvision (libPlayCtrl.so)
+## Requirements
 
-### Instalação do FFmpeg (Debian/Ubuntu)
+- Linux with X11
+- Rust 1.75+
+- FFmpeg development libraries:
 
 ```bash
-sudo apt install libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
+sudo apt install libavformat-dev libavcodec-dev libavutil-dev \
+                 libswscale-dev build-essential pkg-config libssl-dev
 ```
 
-### Instalação para Windows (WSL2)
+## Build & Run
 
-Para compilar no Windows, recomenda-se usar WSL2 (Windows Subsystem for Linux):
-
-```powershell
-# 1. Instalar WSL2 (PowerShell como Administrador)
-wsl --install -d Ubuntu-22.04
-
-# 2. Instalar dependências no Ubuntu/WSL
-sudo apt update
-sudo apt install build-essential pkg-config libssl-dev
-sudo apt install libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
-
-# 3. Instalar Rust no WSL
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source ~/.cargo/env
-
-# 4. Clonar e compilar
-git clone https://github.com/helliton/hikvision-rs.git
+```bash
+git clone https://github.com/your-username/hikvision-rs.git
 cd hikvision-rs
 cargo build --release
-
-# 5. Executar (via WSL)
-cargo run --release
-
-# 6. Para executar a versão compilada no Windows
-# Copie o binário para o Windows
-cp target/release/hikvision-rs.exe /mnt/c/Users/<seu_usuario>/
-
-# Ou use uma interface gráfica via WSL (requer X server)
-# Instale VcXsrv ou X410 no Windows, depois:
-export DISPLAY=:0
 cargo run --release
 ```
 
-**Alternativa Windows Nativo**: O projeto pode ser adaptado para Windows usando `winapi` e `libavcodec` via vcpkg ou distribuição manual das DLLs do FFmpeg. Contribuições são bem-vindas!
-
-## Ajustes de Performance
-
-### Windows (WSL2)
-- A performance de decodificação de vídeo no WSL2 pode variar; para melhor performance:
-  - Use WSL2 com suporte a GPU (requer Windows 11 + driver WSLg)
-  - Aumente a memória do WSL2 no arquivo `.wslconfig`:
-    ```ini
-    [wsl2]
-    memory=4GB
-    processors=4
-    ```
-
-### Linux
-- Para sistemas com múltiplos núcleos, a decodificação FFmpeg pode ser otimizada:
-  ```bash
-  # Verificar número de threads disponíveis
-  nproc
-  ```
-- Para sistemas com GPU NVIDIA, considere usar VA-API ou NVDEC:
-  ```bash
-  # Instalar drivers NVIDIA e VA-API
-  sudo apt install nvidia-driver-535 libva2 vainfo
-  ```
-
-### Bibliotecas do SDK Hikvision (para streams criptografados)
-
-Para usar os modos **PlayCtrl** ou **Canal Zero** com criptografia ativada, você precisa da biblioteca proprietária `libPlayCtrl.so` do SDK Hikvision.
-
-#### Onde obter
-
-1. **Script automático** (recomendado):
-   ```bash
-   ./sdkdownload.sh <URL_DO_SDK>
-   # O script baixa e extrai o SDK em hikvision-libs/
-   # Obtenha o link em: https://www.hikvision.com/en/support/download/sdk/
-   ```
-2. **Device Network SDK**: Baixe o [SDK para Linux 64-bit](https://www.hikvision.com/en/support/download/sdk/) no site oficial da Hikvision
-3. **LocalComponent**: Se você já usa o plugin web Hikvision, a biblioteca pode estar em:
-   ```
-   ~/.local/share/hikvision/weblocalserver/files/bin/libPlayCtrl.so
-   ```
-
-#### Instalação das bibliotecas
-
-Copie **todas** as bibliotecas do SDK para um dos caminhos de busca:
+Or use the Makefile:
 
 ```bash
-# Opção 1: Diretório do projeto (junto ao binário)
-# Copie todos os .so do SDK para hikvision-libs/
-cp lib*.so hikvision-libs/
-cp -r HCNetSDKCom hikvision-libs/
-
-# Opção 2: Diretório de configuração do usuário (RECOMENDADO)
-# Útil para não esquecer após reinstalar o aplicativo - as libs ficam
-# persistentes em ~/.config/hikvision-rs/
-mkdir -p ~/.config/hikvision-rs
-cp lib*.so ~/.config/hikvision-rs/
-cp -r HCNetSDKCom ~/.config/hikvision-rs/
-
-# Opção 3: Sistema (requer sudo)
-sudo cp lib*.so /usr/local/lib/
-sudo cp -r HCNetSDKCom /usr/local/lib/
-sudo ldconfig
+make release   # build
+make run       # run (debug)
+make run-release
+sudo make install  # install to /usr/local/bin
 ```
 
-> **Importante**: São necessárias **várias** bibliotecas, não apenas `libPlayCtrl.so`. Você precisa copiar também `libAudioRender.so`, `libSuperRender.so`, `libHCCore.so`, `libhcnetsdk.so`, `libhpr.so`, `libNPQos.so`, `libz.so` e o diretório `HCNetSDKCom/` com seus componentes. O script `sdkdownload.sh` faz isso automaticamente.
+## SDK Libraries (optional)
 
-#### Verificação
-
-O aplicativo busca automaticamente as bibliotecas nos seguintes locais (em ordem):
-
-1. `./hikvision-libs/` (todas as libs + HCNetSDKCom/)
-2. `~/.config/hikvision-rs/` (todas as libs + HCNetSDKCom/)
-3. `~/.local/share/hikvision/weblocalserver/files/bin/`
-4. `/usr/local/lib/`
-5. `/usr/lib/`
-
-Se não encontrar `libPlayCtrl.so`, você verá o erro: `libPlayCtrl.so not found in any search path.`
-
-## Compilação e Instalação
+For encrypted streaming, download the Hikvision SDK and place the `.so`
+files in `hikvision-libs/`:
 
 ```bash
-# Compilar
-make release
-# ou: cargo build --release
-
-# Instalar (requer sudo)
-sudo make install
-# Binário será instalado em: /usr/local/bin/hikvision-rs
-# Ícone e .desktop serão instalados automaticamente
-# Bibliotecas .so do SDK serão copiadas para /usr/local/lib/
-
-# Uninstall
-sudo make uninstall
+./sdkdownload.sh
 ```
 
-> **Nota**: Se você pretende usar PlayCtrl ou Canal Zero com criptografia, o `make install` tentará copiar automaticamente as bibliotecas do SDK de `hikvision-libs/` ou `~/.config/hikvision-rs/` para `/usr/local/lib/`.
+Or copy manually to any of these paths (searched in order):
 
-## Uso
+- `hikvision-libs/` (project root)
+- `~/.config/hikvision-rs/`
+- `/usr/local/lib/`
 
-```bash
-cargo run --release
+## Usage
+
+1. Launch the app
+2. Enter DVR/NVR IP, port, username, password
+3. Select a streaming method
+4. Click **Connect**
+5. Click a channel in the sidebar to start viewing
+
+## Streaming Methods
+
+| Method     | Encryption | FPS  | Dependency            |
+|------------|------------|------|-----------------------|
+| Snapshot   | Yes        | 2–3  | None                  |
+| RTSP       | No         | 25+  | FFmpeg                |
+| PlayCtrl   | Yes        | 15+  | libPlayCtrl.so        |
+| HCNetSDK   | Yes        | 15+  | libhcnetsdk.so + PlayCtrl |
+| HCNetSDK X11 | Yes      | 25+  | libhcnetsdk.so + X11  |
+
+## Architecture
+
+```
+src/
+├── main.rs                 # egui UI (login, viewer, multi-stream)
+├── api.rs                  # ISAPI HTTP client (Digest auth, channels)
+├── i18n.rs                 # English / Portuguese strings
+├── rtsp.rs                 # FFmpeg H.264/H.265 → RGBA
+├── snapshot_stream.rs      # JPEG polling → RGBA
+├── playctrl.rs             # libPlayCtrl.so FFI bindings
+├── playctrl_stream.rs      # RTSP + PlayCtrl decryption + decode
+├── hcnetsdk.rs             # libhcnetsdk.so FFI bindings
+├── hcnetsdk_multi_stream.rs    # SDK callback + PlayM4 per channel
+├── hcnetsdk_x11_multi.rs       # SDK X11 overlay per channel
+├── hcnetsdk_stream.rs          # Single-channel SDK X11
+├── encrypted_stream.rs         # WebSocket encrypted stream protocol
+├── netstream.rs                # libnet_stream.so FFI
+├── x11_window.rs               # Standalone X11 preview window
+└── x11_embed.rs                # X11 child windows embedded in egui
 ```
 
-1. Preencha os dados de conexão (host, porta HTTP, porta RTSP, usuário, senha)
-2. **Escolha o modo de streaming**:
-   - **RTSP direto**: streaming contínuo (requer criptografia desativada)
-   - **Snapshot**: polling de JPEG (~2-3 FPS, funciona com criptografia)
-   - **PlayCtrl**: descriptografia com libPlayCtrl.so (requer Verification Code)
-   - **Canal Zero**: stream multiplexado (requer ativação no DVR + Verification Code)
-3. Clique em **Connect**
-4. **Modo 1x1**: clique em um canal na barra lateral para exibir em tela cheia
-5. **Modo multi-view** (2x2, 3x3, 4x4): marque os canais desejados com checkbox para exibir em grade
+## Auxiliary Tools
 
-## Modos de Streaming
+Available under `cargo run --bin <name>`:
 
-### RTSP Direto
-- **Protocolo**: RTSP/RTP com FFmpeg
-- **FPS**: 25-30
-- **Requisitos**: Criptografia de Transmissão **desativada** no DVR
-- **Uso**: Melhor qualidade e fluidez quando criptografia não é necessária
+- `zero_channel_hcnetsdk` — Canal Zero exploration / testing
+- `playctrl_proxy` / `jpeg_proxy` — stream relay proxies
+- `decrypt_proxy` — NetStream-based decryption relay
+- `latency_test` — RTSP latency measurement
+- `sniff` — HTTP debug sniffer
 
-### Snapshot (JPEG Polling)
-- **Protocolo**: HTTP GET `/ISAPI/Streaming/channels/{cid}/picture`
-- **FPS**: ~2-3 (configurável 100-2000ms)
-- **Requisitos**: Nenhum
-- **Vantagens**: ✅ Funciona com criptografia ativada, sem dependências extras
-- **Desvantagens**: Baixo FPS, não é vídeo contínuo
-- **Uso**: Monitoramento não crítico com criptografia ativada
+## License
 
-### PlayCtrl (Descriptografia)
-- **Protocolo**: RTP + descriptografia AES-256-CBC
-- **FPS**: 25-30
-- **Requisitos**: libPlayCtrl.so + Verification Code do DVR
-- **Uso**: Streaming fluido com criptografia ativada
-
-### Canal Zero (Channel Zero)
-- **Protocolo**: RTSP multiplexado com descriptografia manual
-- **FPS**: 25-30
-- **URL**: `rtsp://admin:<SENHA>@<DVR_IP>:554/Streaming/channels/001`
-- **Requisitos**: 
-  - DVR com suporte a Canal Zero (verificado via `zeroChanNum` no deviceInfo)
-  - Canal Zero ativado no DVR: Configurações > Visualização > Canal Zero
-  - **Verification Code** para streams criptografados
-  - Senha **crua** (ex: `#minhaSenha`), **sem URL encoding** — o DVR não decodifica `%XX`
-- **Vantagens**: Visualiza múltiplas câmeras em um único stream (economia de banda)
-- **Uso**: Visualização em grid de múltiplas câmeras com menor consumo de banda
-- **Nota**: O Canal Zero multiplexado não é acessível via APIs convencionais; requer URL RTSP customizada para o canal 001/002
-
-
+MIT
