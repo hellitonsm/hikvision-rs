@@ -56,13 +56,13 @@ pub fn default_library_path() -> PathBuf {
         .find(|p| p.exists())
         .unwrap_or_else(|| {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-            PathBuf::from(home).join(".local/share/hikvision/weblocalserver/files/bin/libPlayCtrl.so")
+            PathBuf::from(&home).join(".config/hikvision-rs/libPlayCtrl.so")
         })
 }
 
 pub fn default_library_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    PathBuf::from(home).join(".local/share/hikvision/weblocalserver/files/bin")
+    PathBuf::from(&home).join(".config/hikvision-rs")
 }
 
 pub fn search_and_load() -> Result<PlayCtrl> {

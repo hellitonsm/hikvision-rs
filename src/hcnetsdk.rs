@@ -343,12 +343,38 @@ pub fn search_and_load() -> Result<HCNetSDK> {
 /// Matching rustdemo's approach where these are linked at compile time via
 /// `cargo:rustc-link-lib=dylib=AudioRender` etc., so the dynamic linker already
 /// has them loaded before any dlopen happens.
-fn load_playctrl(lib_dir: &Path) -> Result<Option<Library>> {
-    let path = lib_dir.join("libPlayCtrl.so");
-    if !path.exists() {
-        log::warn!("libPlayCtrl.so not found at {}", path.display());
-        return Ok(None);
+fn load_playctrl() -> Result<Option<Library>> {
+    // Search for libPlayCtrl.so using the same paths as playctrl.rs
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let config_dir = PathBuf::from(&home).join(".config/hikvision-rs");
+    let localcomponent = PathBuf::from(&home).join(".local/share/hikvision/weblocalserver/files/bin");
+
+    let search_paths = vec![
+        cwd.join("hikvision-libs/libPlayCtrl.so"),
+        config_dir.join("libPlayCtrl.so"),
+        localcomponent.join("libPlayCtrl.so"),
+        PathBuf::from("/usr/local/lib/libPlayCtrl.so"),
+        PathBuf::from("/usr/lib/libPlayCtrl.so"),
+    ];
+
+    let mut lib_dir: Option<PathBuf> = None;
+    let mut path_opt: Option<PathBuf> = None;
+
+    for p in &search_paths {
+        if p.exists() {
+            path_opt = Some(p.clone());
+            lib_dir = p.parent().map(|d| d.to_path_buf());
+            break;
+        }
     }
+
+    let Some(path) = path_opt else {
+        log::warn!("libPlayCtrl.so not found in any search path.");
+        return Ok(None);
+    };
+
+    let lib_dir = lib_dir.unwrap_or_else(|| path.parent().unwrap().to_path_buf());
 
     // Pre-load transitive deps via absolute paths so the dynamic linker doesn't
     // need LD_LIBRARY_PATH to resolve DT_NEEDED entries in libPlayCtrl.so.
@@ -359,8 +385,6 @@ fn load_playctrl(lib_dir: &Path) -> Result<Option<Library>> {
                 Ok(_) => log::info!("Pre-loaded dep {dep}"),
                 Err(e) => log::warn!("Failed to pre-load dep {dep}: {e}"),
             }
-        } else {
-            log::warn!("Dep {dep} not found at {dep_path:?}");
         }
     }
 
@@ -466,7 +490,7 @@ impl HCNetSDK {
         // reuses our already-loaded handle and skips RTLD_NOW symbol
         // resolution (which fails on missing libAudioRender.so /
         // libSuperRender.so).
-        let _lib_playctrl = match load_playctrl(lib_dir) {
+        let _lib_playctrl = match load_playctrl() {
             Ok(lib) => {
                 log::info!("Pre-loaded libPlayCtrl.so — RealPlay window mode should work");
                 lib
