@@ -137,9 +137,11 @@ impl PreviewWindow {
         while let Ok(Some(event)) = self.conn.poll_for_event() {
             match event {
                 Event::ClientMessage(msg) => {
-                    if msg.type_ == self.wm_delete {
-                        log::info!("WM_DELETE_WINDOW received");
-                        return false;
+                    if msg.type_ == self.wm_protocols {
+                        if msg.data.as_data32()[0] == self.wm_delete {
+                            log::info!("WM_DELETE_WINDOW received");
+                            return false;
+                        }
                     }
                 }
                 Event::DestroyNotify(ev) => {

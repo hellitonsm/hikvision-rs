@@ -251,7 +251,7 @@ fn main() -> Result<()> {
     let mut user = "admin".to_string();
     let mut password = String::new();
     let mut listen = "127.0.0.1:9000".to_string();
-    let mut vcode = "KeZtid".to_string();
+    let mut vcode = String::new();
 
     let mut i = 1;
     while i < args.len() {
@@ -262,7 +262,7 @@ fn main() -> Result<()> {
             "--user" => { i += 1; user = args.get(i).cloned().unwrap_or_else(|| "admin".to_string()); }
             "--password" => { i += 1; password = args.get(i).cloned().unwrap_or_default(); }
             "--listen" => { i += 1; listen = args.get(i).cloned().unwrap_or_else(|| "127.0.0.1:9000".to_string()); }
-            "--verification-code" => { i += 1; vcode = args.get(i).cloned().unwrap_or_else(|| "****".to_string()); }
+            "--verification-code" => { i += 1; vcode = args.get(i).cloned().unwrap_or_default(); }
             _ => {}
         }
         i += 1;

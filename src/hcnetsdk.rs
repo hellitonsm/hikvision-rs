@@ -71,6 +71,10 @@ pub const LINK_UDP: DWORD = 1;
 pub const LINK_RTSP: DWORD = 4;
 pub const LINK_RTSP_HTTP: DWORD = 5;
 
+// Ability types for NET_DVR_GetDeviceAbility
+pub const DEVICE_DYNCHAN_ABILITY: DWORD = 0x00b;  // digital channel ability (XML)
+pub const DEVICE_ABILITY_INFO: DWORD = 0x011;     // common ability, XML node in pInBuf
+
 // Data types for callback
 pub const NET_DVR_SYSHEAD: DWORD = 1;
 pub const NET_DVR_STREAMDATA: DWORD = 2;
@@ -183,6 +187,19 @@ pub struct NET_DVR_PREVIEWINFO {
     pub byRes: [u8; 213],
 }
 
+/// Client preview info for NET_DVR_RealPlay_V30 (API antiga, mais permissiva).
+/// bit 31 de lLinkMode: 0=main stream, 1=sub stream.
+/// bits 0-30 de lLinkMode: 0=TCP, 1=UDP, 2=Multicast, 3=RTP, 4=RTP/RTSP, 5=RSTP/HTTP
+#[repr(C)]
+pub struct NET_DVR_CLIENTINFO {
+    pub lChannel: LONG,
+    pub lLinkMode: LONG,  // bit31=stream_type, bits0-30=link_mode
+    pub hPlayWnd: HWND,
+    pub sMultiCastIP: *mut c_char,  // null = no multicast
+    pub byProtoType: u8,  // 0=private, 1=RTSP
+    pub byRes: [u8; 3],
+}
+
 /// Callback type for real-time stream data
 pub type REALDATACALLBACK = extern "C" fn(LONG, DWORD, *mut u8, DWORD, *mut c_void);
 
@@ -199,6 +216,33 @@ pub struct NET_DVR_ZEROCHANCFG {
 
 pub const NET_DVR_GET_ZEROCHANCFG: DWORD = 1102;
 pub const NET_DVR_SET_ZEROCHANCFG: DWORD = 1103;
+pub const NET_DVR_GET_ZERO_PREVIEWCFG_V30: DWORD = 1104;
+pub const NET_DVR_SET_ZERO_PREVIEWCFG_V30: DWORD = 1105;
+
+/// Zero channel preview config (command 1104/1105).
+/// bySwitchSeq[preview_mode][window] maps window position to channel number.
+/// 0xFF = window not used. MAX_PREVIEW_MODE=8, MAX_WINDOW_V30=32.
+#[repr(C)]
+pub struct NET_DVR_PREVIEWCFG_V30 {
+    pub dwSize: u32,
+    pub byPreviewNumber: u8,    // 0=1w, 1=4w, 2=9w, 3=16w, 0xff=max
+    pub byEnableAudio: u8,
+    pub wSwitchTime: u16,
+    pub bySwitchSeq: [[u8; 32]; 8], // 256 bytes: [mode][window] = channel
+    pub byRes: [u8; 24],
+}
+
+/// Preview info for NET_DVR_RealPlaySpecial (custom RTSP URL preview).
+/// Allows passing an arbitrary RTSP URL directly to the SDK.
+#[repr(C)]
+pub struct NET_DVR_PREVIEWINFO_SPECIAL {
+    pub sURL: [c_char; 1024],
+    pub dwLinkMode: DWORD,
+    pub hPlayWnd: HWND,
+    pub bBlocked: DWORD,
+    pub dwDisplayBufNum: DWORD,
+    pub byRes: [u8; 64],
+}
 
 macro_rules! get_fn {
     ($lib:expr, $name:literal, $sig:ty) => {
@@ -343,11 +387,15 @@ pub struct HCNetSDK {
     _set_connect_time: unsafe extern "C" fn(DWORD, DWORD) -> BOOL,
     _set_sdk_secret_key: unsafe extern "C" fn(LONG, *const c_char) -> BOOL,
     _realplay_v40: unsafe extern "C" fn(LONG, *const NET_DVR_PREVIEWINFO, Option<REALDATACALLBACK>, *mut c_void) -> LONG,
+    _realplay_v30: unsafe extern "C" fn(LONG, *const NET_DVR_CLIENTINFO, Option<REALDATACALLBACK>, *mut c_void, BOOL) -> LONG,
     _stop_realplay: unsafe extern "C" fn(LONG) -> BOOL,
     _get_last_error: unsafe extern "C" fn() -> DWORD,
     _set_player_buf_number: unsafe extern "C" fn(LONG) -> BOOL,
     _get_dvr_config: unsafe extern "C" fn(LONG, DWORD, LONG, *mut c_void, DWORD, *mut DWORD) -> BOOL,
     _set_dvr_config: unsafe extern "C" fn(LONG, DWORD, LONG, *const c_void, DWORD) -> BOOL,
+    _get_device_ability: unsafe extern "C" fn(LONG, DWORD, *const c_char, DWORD, *mut c_char, DWORD) -> BOOL,
+    _realplay_special: unsafe extern "C" fn(LONG, *const NET_DVR_PREVIEWINFO_SPECIAL, Option<REALDATACALLBACK>, *mut c_void) -> LONG,
+    _zero_make_key_frame: unsafe extern "C" fn(LONG, LONG) -> BOOL,
 }
 
 impl HCNetSDK {
@@ -401,11 +449,15 @@ impl HCNetSDK {
         let set_connect_time = *get_fn!(_lib, b"NET_DVR_SetConnectTime", unsafe extern "C" fn(DWORD, DWORD) -> BOOL);
         let set_sdk_secret_key = *get_fn!(_lib, b"NET_DVR_SetSDKSecretKey", unsafe extern "C" fn(LONG, *const c_char) -> BOOL);
         let realplay_v40 = *get_fn!(_lib, b"NET_DVR_RealPlay_V40", unsafe extern "C" fn(LONG, *const NET_DVR_PREVIEWINFO, Option<REALDATACALLBACK>, *mut c_void) -> LONG);
+        let realplay_v30 = *get_fn!(_lib, b"NET_DVR_RealPlay_V30", unsafe extern "C" fn(LONG, *const NET_DVR_CLIENTINFO, Option<REALDATACALLBACK>, *mut c_void, BOOL) -> LONG);
         let stop_realplay = *get_fn!(_lib, b"NET_DVR_StopRealPlay", unsafe extern "C" fn(LONG) -> BOOL);
         let get_last_error = *get_fn!(_lib, b"NET_DVR_GetLastError", unsafe extern "C" fn() -> DWORD);
         let set_player_buf_number = *get_fn!(_lib, b"NET_DVR_SetPlayerBufNumber", unsafe extern "C" fn(LONG) -> BOOL);
         let get_dvr_config = *get_fn!(_lib, b"NET_DVR_GetDVRConfig", unsafe extern "C" fn(LONG, DWORD, LONG, *mut c_void, DWORD, *mut DWORD) -> BOOL);
         let set_dvr_config = *get_fn!(_lib, b"NET_DVR_SetDVRConfig", unsafe extern "C" fn(LONG, DWORD, LONG, *const c_void, DWORD) -> BOOL);
+        let get_device_ability = *get_fn!(_lib, b"NET_DVR_GetDeviceAbility", unsafe extern "C" fn(LONG, DWORD, *const c_char, DWORD, *mut c_char, DWORD) -> BOOL);
+        let zero_make_key_frame = *get_fn!(_lib, b"NET_DVR_ZeroMakeKeyFrame", unsafe extern "C" fn(LONG, LONG) -> BOOL);
+        let realplay_special = *get_fn!(_lib, b"NET_DVR_RealPlaySpecial", unsafe extern "C" fn(LONG, *const NET_DVR_PREVIEWINFO_SPECIAL, Option<REALDATACALLBACK>, *mut c_void) -> LONG);
 
         log::info!("Loaded libhcnetsdk.so from {}", path.display());
 
@@ -437,11 +489,15 @@ impl HCNetSDK {
             _set_connect_time: set_connect_time,
             _set_sdk_secret_key: set_sdk_secret_key,
             _realplay_v40: realplay_v40,
+            _realplay_v30: realplay_v30,
+            _realplay_special: realplay_special,
             _stop_realplay: stop_realplay,
             _get_last_error: get_last_error,
             _set_player_buf_number: set_player_buf_number,
             _get_dvr_config: get_dvr_config,
             _set_dvr_config: set_dvr_config,
+            _get_device_ability: get_device_ability,
+            _zero_make_key_frame: zero_make_key_frame,
         })
     }
 
@@ -606,14 +662,34 @@ impl HCNetSDK {
     /// O SDK renderiza vídeo diretamente na janela via overlay — sem callback.
     /// A janela X11 DEVE estar mapeada (visível) antes desta chamada.
     pub fn realplay_with_window(&self, user_id: LONG, channel: LONG, stream_type: DWORD, hwnd: HWND) -> Result<LONG> {
+        self.realplay_with_window_ex(user_id, channel, stream_type, LINK_TCP, hwnd)
+    }
+
+    /// Como `realplay_with_window` mas permite especificar `link_mode`.
+    pub fn realplay_with_window_ex(&self, user_id: LONG, channel: LONG, stream_type: DWORD, link_mode: DWORD, hwnd: HWND) -> Result<LONG> {
+        self.realplay_with_window_ex2(user_id, channel, stream_type, link_mode, 0, hwnd)
+    }
+
+    /// Como `realplay_with_window_ex` mas permite especificar `link_mode` e `preview_mode`.
+    pub fn realplay_with_window_ex2(&self, user_id: LONG, channel: LONG, stream_type: DWORD, link_mode: DWORD, preview_mode: u8, hwnd: HWND) -> Result<LONG> {
+        self.realplay_with_window_ex3(user_id, channel, stream_type, link_mode, preview_mode, 0, 0, hwnd)
+    }
+
+    /// Como `realplay_with_window_ex2` mas permite especificar `data_type` e `proto_type`.
+    /// - `data_type`: 0=private (default), 1=standard (PS stream)
+    /// - `proto_type`: 0=private (default), 1=RTSP
+    pub fn realplay_with_window_ex3(&self, user_id: LONG, channel: LONG, stream_type: DWORD, link_mode: DWORD, preview_mode: u8, data_type: u8, proto_type: u8, hwnd: HWND) -> Result<LONG> {
         let mut preview_info: NET_DVR_PREVIEWINFO = unsafe { std::mem::zeroed() };
 
         preview_info.lChannel = channel;
         preview_info.dwStreamType = stream_type;
-        preview_info.dwLinkMode = LINK_TCP;
+        preview_info.dwLinkMode = link_mode;
         preview_info.hPlayWnd = hwnd;
         preview_info.bBlocked = 1;
         preview_info.dwDisplayBufNum = 1;
+        preview_info.byPreviewMode = preview_mode;
+        preview_info.byDataType = data_type;
+        preview_info.byProtoType = proto_type;
 
         let handle = unsafe { (self._realplay_v40)(user_id, &preview_info, None, std::ptr::null_mut()) };
 
@@ -622,7 +698,112 @@ impl HCNetSDK {
             anyhow::bail!("NET_DVR_RealPlay_V40 (window) failed (error {})", err);
         }
 
-        log::info!("RealPlay (window) started, handle={}, hwnd=0x{:x}", handle, hwnd);
+        log::info!("RealPlay (window) started, handle={}, channel={}, stream={}, link={}, pm={}, dt={}, pt={}, hwnd=0x{:x}",
+            handle, channel, stream_type, link_mode, preview_mode, data_type, proto_type, hwnd);
+        Ok(handle)
+    }
+
+    /// API V30 antiga — mais permissiva que a V40, pode funcionar quando V40 falha.
+    /// lLinkMode: bit31=0 main, bit31=1 sub; bits0-30=link_mode (0=TCP).
+    pub fn realplay_v30_with_window(&self, user_id: LONG, channel: LONG, is_sub_stream: bool, hwnd: HWND) -> Result<LONG> {
+        let mut ci: NET_DVR_CLIENTINFO = unsafe { std::mem::zeroed() };
+
+        ci.lChannel = channel;
+        ci.lLinkMode = if is_sub_stream { i32::MIN } else { 0i32 };  // bit31 = stream_type
+        ci.hPlayWnd = hwnd;
+        ci.sMultiCastIP = std::ptr::null_mut();
+        ci.byProtoType = 0;
+
+        let handle = unsafe { (self._realplay_v30)(user_id, &ci, None, std::ptr::null_mut(), 1) };
+
+        if handle < 0 {
+            let err = self.get_last_error();
+            anyhow::bail!("NET_DVR_RealPlay_V30 (window) failed (error {})", err);
+        }
+
+        log::info!("RealPlay V30 started, handle={}, channel={}, sub={}, hwnd=0x{:x}",
+            handle, channel, is_sub_stream, hwnd);
+        Ok(handle)
+    }
+
+    /// API V30 com byProtoType=1 (RTSP) — variação que pode funcionar quando
+    /// byProtoType=0 (private) falha, especialmente para canais virtuais/IP.
+    pub fn realplay_v30_with_window_rtsp(&self, user_id: LONG, channel: LONG, is_sub_stream: bool, hwnd: HWND) -> Result<LONG> {
+        let mut ci: NET_DVR_CLIENTINFO = unsafe { std::mem::zeroed() };
+
+        ci.lChannel = channel;
+        ci.lLinkMode = if is_sub_stream { i32::MIN } else { 0i32 };
+        ci.hPlayWnd = hwnd;
+        ci.sMultiCastIP = std::ptr::null_mut();
+        ci.byProtoType = 1;  // 1=RTSP
+
+        let handle = unsafe { (self._realplay_v30)(user_id, &ci, None, std::ptr::null_mut(), 1) };
+
+        if handle < 0 {
+            let err = self.get_last_error();
+            anyhow::bail!("NET_DVR_RealPlay_V30_RTSP (window) failed (error {})", err);
+        }
+
+        log::info!("RealPlay V30 RTSP started, handle={}, channel={}, sub={}, hwnd=0x{:x}",
+            handle, channel, is_sub_stream, hwnd);
+        Ok(handle)
+    }
+
+    /// NET_DVR_RealPlaySpecial: preview com URL RTSP customizada.
+    /// Permite passar uma URL RTSP arbitrária (ex: com ?zeroChannel=1).
+    pub fn realplay_special(&self, user_id: LONG, url: &str, link_mode: DWORD, hwnd: HWND) -> Result<LONG> {
+        let mut info: NET_DVR_PREVIEWINFO_SPECIAL = unsafe { std::mem::zeroed() };
+
+        let url_bytes = url.as_bytes();
+        let n = url_bytes.len().min(1023);
+        info.sURL[..n].copy_from_slice(unsafe { &*(&url_bytes[..n] as *const [u8] as *const [i8]) });
+        info.dwLinkMode = link_mode;
+        info.hPlayWnd = hwnd;
+        info.bBlocked = 1;
+        info.dwDisplayBufNum = 1;
+
+        let handle = unsafe { (self._realplay_special)(user_id, &info, None, std::ptr::null_mut()) };
+
+        if handle < 0 {
+            let err = self.get_last_error();
+            anyhow::bail!("NET_DVR_RealPlaySpecial failed (error {})", err);
+        }
+
+        log::info!("RealPlaySpecial started, handle={}, url={}, link={}, hwnd=0x{:x}",
+            handle, url, link_mode, hwnd);
+        Ok(handle)
+    }
+
+    /// NET_DVR_RealPlaySpecial com data callback em vez de janela.
+    /// Útil quando a renderização em janela falha, permite processar
+    /// o stream manualmente (ex: via PlayM4).
+    pub fn realplay_special_with_callback(
+        &self,
+        user_id: LONG,
+        url: &str,
+        link_mode: DWORD,
+        callback: REALDATACALLBACK,
+        user_data: *mut c_void,
+    ) -> Result<LONG> {
+        let mut info: NET_DVR_PREVIEWINFO_SPECIAL = unsafe { std::mem::zeroed() };
+
+        let url_bytes = url.as_bytes();
+        let n = url_bytes.len().min(1023);
+        info.sURL[..n].copy_from_slice(unsafe { &*(&url_bytes[..n] as *const [u8] as *const [i8]) });
+        info.dwLinkMode = link_mode;
+        info.hPlayWnd = 0;
+        info.bBlocked = 0;
+        info.dwDisplayBufNum = 1;
+
+        let handle = unsafe { (self._realplay_special)(user_id, &info, Some(callback), user_data) };
+
+        if handle < 0 {
+            let err = self.get_last_error();
+            anyhow::bail!("NET_DVR_RealPlaySpecial (callback) failed (error {})", err);
+        }
+
+        log::info!("RealPlaySpecial (callback) started, handle={}, url={}, link={}",
+            handle, url, link_mode);
         Ok(handle)
     }
 
@@ -655,9 +836,129 @@ impl HCNetSDK {
         unsafe { (self._get_last_error)() }
     }
 
-    /// Check if Canal Zero is enabled via SDK, and optionally enable it.
-    /// Uses NET_DVR_GET_ZEROCHANCFG (1102) / NET_DVR_SET_ZEROCHANCFG (1103).
-    /// Returns (currently_enabled, was_enabled_by_us).
+    /// Query device ability via XML.
+    /// - `ability_type`: e.g. `DEVICE_ABILITY_INFO` or `DEVICE_DYNCHAN_ABILITY`
+    /// - `input_xml`: XML string for the specific ability node (e.g. `<PreviewSwitchAbility>`)
+    ///   or empty for ability types that don't need input
+    /// Returns the XML response from the device.
+    pub fn get_device_ability(&self, user_id: LONG, ability_type: DWORD, input_xml: &str) -> Result<String> {
+        let in_c = CString::new(input_xml).context("input_xml contains null byte")?;
+        let mut out_buf = vec![0u8; 2048];
+
+        let ret = unsafe {
+            (self._get_device_ability)(
+                user_id,
+                ability_type,
+                in_c.as_ptr(),
+                input_xml.len() as DWORD,
+                out_buf.as_mut_ptr() as *mut c_char,
+                out_buf.len() as DWORD,
+            )
+        };
+
+        if ret == 0 {
+            let err = self.get_last_error();
+            anyhow::bail!("NET_DVR_GetDeviceAbility failed (error {})", err);
+        }
+
+        // Find the null terminator
+        let len = out_buf.iter().position(|&b| b == 0).unwrap_or(out_buf.len());
+        let xml = String::from_utf8_lossy(&out_buf[..len]).to_string();
+        log::info!("GetDeviceAbility type=0x{:x} returned {} bytes XML", ability_type, len);
+        Ok(xml)
+    }
+
+    /// Query device ability with raw binary input (e.g. DWORD channel number for DYNCHAN_ABILITY).
+    pub fn get_device_ability_raw(&self, user_id: LONG, ability_type: DWORD, input: &[u8]) -> Result<String> {
+        let mut out_buf = vec![0u8; 2048];
+
+        let ret = unsafe {
+            (self._get_device_ability)(
+                user_id,
+                ability_type,
+                input.as_ptr() as *const c_char,
+                input.len() as DWORD,
+                out_buf.as_mut_ptr() as *mut c_char,
+                out_buf.len() as DWORD,
+            )
+        };
+
+        if ret == 0 {
+            let err = self.get_last_error();
+            anyhow::bail!("NET_DVR_GetDeviceAbility failed (error {})", err);
+        }
+
+        let len = out_buf.iter().position(|&b| b == 0).unwrap_or(out_buf.len());
+        let xml = String::from_utf8_lossy(&out_buf[..len]).to_string();
+        log::info!("GetDeviceAbility raw type=0x{:x} returned {} bytes XML", ability_type, len);
+        Ok(xml)
+    }
+    /// Generic NET_DVR_GetDVRConfig: reads device configuration struct.
+    /// `cfg` should have `dwSize` set (first field) before calling.
+    /// `command`: SDK command code (e.g. NET_DVR_GET_ZEROCHANCFG).
+    /// `channel`: channel number (0 for global configs).
+    pub fn get_dvr_config<T: Sized>(&self, user_id: LONG, command: DWORD, channel: LONG, cfg: &mut T) -> Result<()> {
+        let size = std::mem::size_of::<T>() as u32;
+        let mut bytes_returned: DWORD = 0;
+
+        let ret = unsafe {
+            (self._get_dvr_config)(
+                user_id,
+                command,
+                channel,
+                cfg as *mut _ as *mut c_void,
+                size,
+                &mut bytes_returned,
+            )
+        };
+
+        if ret == 0 {
+            let err = self.get_last_error();
+            anyhow::bail!("NET_DVR_GetDVRConfig(command=0x{:x}) failed (error {})", command, err);
+        }
+
+        log::info!("NET_DVR_GetDVRConfig(command=0x{:x}) returned {} bytes", command, bytes_returned);
+        Ok(())
+    }
+
+    /// Generic NET_DVR_SetDVRConfig: writes device configuration struct.
+    pub fn set_dvr_config<T: Sized>(&self, user_id: LONG, command: DWORD, channel: LONG, cfg: &T) -> Result<()> {
+        let size = std::mem::size_of::<T>() as u32;
+
+        let ret = unsafe {
+            (self._set_dvr_config)(
+                user_id,
+                command,
+                channel,
+                cfg as *const _ as *const c_void,
+                size,
+            )
+        };
+
+        if ret == 0 {
+            let err = self.get_last_error();
+            anyhow::bail!("NET_DVR_SetDVRConfig(command=0x{:x}) failed (error {})", command, err);
+        }
+
+        log::info!("NET_DVR_SetDVRConfig(command=0x{:x}) succeeded", command);
+        Ok(())
+    }
+
+    /// Probe and trigger a key frame on the zero channel.
+    /// `zero_chan`: the zero channel number to probe.
+    /// Returns true if the device accepted it (likely the correct zero channel number).
+    pub fn zero_make_key_frame(&self, user_id: LONG, zero_chan: LONG) -> Result<bool> {
+        let ret = unsafe { (self._zero_make_key_frame)(user_id, zero_chan) };
+        if ret != 0 {
+            log::info!("NET_DVR_ZeroMakeKeyFrame({}) succeeded", zero_chan);
+            Ok(true)
+        } else {
+            let err = self.get_last_error();
+            log::warn!("NET_DVR_ZeroMakeKeyFrame({}) failed (error {})", zero_chan, err);
+            Ok(false)
+        }
+    }
+
     pub fn ensure_zero_channel_enabled(&self, user_id: LONG, force_enable: bool) -> Result<(bool, bool)> {
         let mut cfg: NET_DVR_ZEROCHANCFG = unsafe { std::mem::zeroed() };
         cfg.dwSize = std::mem::size_of::<NET_DVR_ZEROCHANCFG>() as u32;
