@@ -1,6 +1,7 @@
 use hikvision_rs::api::{check_tls_fingerprint, Channel, DeviceInfo, FingerprintCheck, HikvisionAPI};
 use hikvision_rs::hcnetsdk;
 use hikvision_rs::hcnetsdk_x11_multi;
+use hikvision_rs::i18n::{Lang, Strings};
 use hikvision_rs::playctrl_stream;
 use hikvision_rs::rtsp;
 use hikvision_rs::snapshot_stream;
@@ -27,13 +28,14 @@ enum StreamMethod {
 }
 
 impl StreamMethod {
-    fn label(&self) -> &'static str {
+    fn label(&self, lang: Lang) -> &'static str {
+        let s = Strings::new(lang);
         match self {
-            StreamMethod::Rtsp => "RTSP (direto)",
-            StreamMethod::Snapshot => "Snapshot (JPEG polling)",
-            StreamMethod::PlayCtrl => "PlayCtrl (descriptografia)",
-            StreamMethod::HCNetSDK => "HCNetSDK (callback + PlayM4)",
-            StreamMethod::HCNetSDK_X11 => "HCNetSDK X11 (overlay direto)",
+            StreamMethod::Rtsp => s.method_rtsp(),
+            StreamMethod::Snapshot => s.method_snapshot(),
+            StreamMethod::PlayCtrl => s.method_playctrl(),
+            StreamMethod::HCNetSDK => s.method_hcnetsdk(),
+            StreamMethod::HCNetSDK_X11 => s.method_hcnetsdk_x11(),
         }
     }
 
@@ -121,6 +123,8 @@ struct Config {
     snapshot_interval: u64,
     #[serde(default)]
     cert_fingerprint: Option<String>,
+    #[serde(default)]
+    language: Lang,
 }
 
 impl Default for Config {
@@ -139,6 +143,7 @@ impl Default for Config {
             stream_method: StreamMethod::Snapshot,
             snapshot_interval: 300,
             cert_fingerprint: None,
+            language: Lang::default(),
         }
     }
 }
@@ -196,6 +201,7 @@ impl Config {
                             stream_method,
                             snapshot_interval: old.snapshot_interval.unwrap_or(300),
                             cert_fingerprint: None,
+                            language: Lang::default(),
                         };
                         return cfg;
                     }
@@ -239,6 +245,7 @@ impl Config {
         app.stream_method = self.stream_method;
         app.snapshot_interval = self.snapshot_interval;
         app.cert_fingerprint = self.cert_fingerprint.clone();
+        app.lang = self.language;
     }
 
     fn from_app(app: &HikvisionApp) -> Self {
@@ -256,6 +263,7 @@ impl Config {
             stream_method: app.stream_method,
             snapshot_interval: app.snapshot_interval,
             cert_fingerprint: app.cert_fingerprint.clone(),
+            language: app.lang,
         }
     }
 }
@@ -328,10 +336,10 @@ struct HikvisionApp {
 
     /// Número de canais zero suportados pelo DVR (lido do ISAPI após login).
     zero_channel_available: u8,
-    /// Canal Zero está ativo no momento (toggle runtime).
     zero_channel_active: bool,
-    /// Cópia do grid_slots antes de ativar o Canal Zero (para restaurar ao desativar).
     saved_grid_slots: Vec<Option<usize>>,
+
+    lang: Lang,
 }
 
 impl Default for HikvisionApp {
@@ -369,17 +377,19 @@ impl Default for HikvisionApp {
             zero_channel_available: 0,
             zero_channel_active: false,
             saved_grid_slots: Vec::new(),
+            lang: Lang::default(),
         }
     }
 }
 
 impl HikvisionApp {
     fn connect(&mut self) {
+        let s = self.i18n();
         let host = self.host.trim().to_string();
         let port: u16 = match self.port.trim().parse() {
             Ok(p) => p,
             Err(_) => {
-                self.error = Some("Invalid port".into());
+                self.error = Some(s.error_invalid_port().into());
                 return;
             }
         };
@@ -387,12 +397,12 @@ impl HikvisionApp {
         let password = self.password.clone();
 
         if host.is_empty() {
-            self.error = Some("Host is required".into());
+            self.error = Some(s.error_host_required().into());
             return;
         }
 
         if self.stream_method.needs_verification_code() && self.verification_code.trim().is_empty() {
-            self.error = Some("Verification Code é obrigatório para este método de streaming".into());
+            self.error = Some(s.error_verification_code_required().into());
             return;
         }
 
@@ -402,18 +412,14 @@ impl HikvisionApp {
                 Ok(FingerprintCheck::Match) => {}
                 Ok(FingerprintCheck::New(fp)) => {
                     self.pending_new_fingerprint = Some(fp.clone());
-                    self.error = Some(format!(
-                        "Primeira conexão HTTPS.\nFingerprint do certificado:\n{}\n\nConfie neste certificado?",
-                        fp
-                    ));
+                    let s = self.i18n();
+                    self.error = Some(s.cert_first_https(&fp));
                     return;
                 }
                 Ok(FingerprintCheck::Mismatch(old, new)) => {
                     self.pending_new_fingerprint = Some(new);
-                    self.error = Some(format!(
-                        "Certificate fingerprint changed!\nOld: {}\nNew: {}\nAccept the new fingerprint to proceed.",
-                        old, self.pending_new_fingerprint.as_ref().unwrap()
-                    ));
+                    let s = self.i18n();
+                    self.error = Some(s.cert_changed_fingerprint(&old, self.pending_new_fingerprint.as_ref().unwrap()));
                     return;
                 }
                 Err(e) => {
@@ -884,6 +890,11 @@ impl HikvisionApp {
         self.streams[idx].stream_handle.is_some() || self.streams[idx].frame_rx.is_some()
     }
 
+    /// Return localized strings for the current language.
+    fn i18n(&self) -> Strings {
+        Strings::new(self.lang)
+    }
+
     fn start_zero_channel(&mut self, _ctx: &egui::Context) {
         log::info!("start_zero_channel entered");
         if !self.stream_method.is_x11_overlay() {
@@ -999,11 +1010,12 @@ impl HikvisionApp {
     }
 
     fn show_login(&mut self, ctx: &egui::Context) {
+        let s = self.i18n();
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(100.0);
-                ui.heading("Hikvision DVR Viewer");
-                ui.label("Streaming via ISAPI & RTSP");
+                ui.heading(s.heading());
+                ui.label(s.subtitle());
                 ui.add_space(20.0);
 
                 let field_w = 320.0;
@@ -1012,16 +1024,16 @@ impl HikvisionApp {
                     .spacing([8.0, 6.0])
                     .min_col_width(340.0)
                     .show(ui, |ui| {
-                        ui.label("Host:");
+                        ui.label(s.host_label());
                         ui.add_sized([field_w, field_h], egui::TextEdit::singleline(&mut self.host));
                         ui.end_row();
-                        let port_label = if self.use_https { "HTTPS Port:" } else { "HTTP Port:" };
+                        let port_label = if self.use_https { s.https_port_label() } else { s.http_port_label() };
                         ui.label(port_label);
                         ui.add_sized([field_w, field_h], egui::TextEdit::singleline(&mut self.port));
                         ui.end_row();
                         let prev_https = self.use_https;
-                        ui.label("HTTPS:");
-                        ui.checkbox(&mut self.use_https, "Usar HTTPS (certificado auto-assinado)");
+                        ui.label(s.https_label());
+                        ui.checkbox(&mut self.use_https, s.https_checkbox());
                         if self.use_https != prev_https {
                             let cur_port = self.port.trim().parse().unwrap_or(0);
                             if self.use_https && cur_port == 80 {
@@ -1031,69 +1043,88 @@ impl HikvisionApp {
                             }
                         }
                         ui.end_row();
-                        ui.label("RTSP Port:");
+                        ui.label(s.rtsp_port_label());
                         ui.add_sized([field_w, field_h], egui::TextEdit::singleline(&mut self.rtsp_port));
                         ui.end_row();
                         if self.stream_method.show_sdk_port() {
-                            ui.label("SDK Port:");
+                            ui.label(s.sdk_port_label());
                             ui.add_sized([field_w, field_h], egui::TextEdit::singleline(&mut self.sdk_port).hint_text("8000"));
                             ui.end_row();
                         }
-                        ui.label("Username:");
+                        ui.label(s.username_label());
                         ui.add_sized([field_w, field_h], egui::TextEdit::singleline(&mut self.user));
                         ui.end_row();
-                        ui.label("Password:");
+                        ui.label(s.password_label());
                         ui.add_sized([field_w, field_h], egui::TextEdit::singleline(&mut self.password).password(true));
                         ui.end_row();
-                        ui.label("Método:");
+
+                        let s = self.i18n();
+                        ui.label(s.method_label());
                         egui::ComboBox::from_id_salt("stream_method")
-                            .selected_text(self.stream_method.label())
+                            .selected_text(self.stream_method.label(self.lang))
                             .width(field_w)
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.stream_method, StreamMethod::Rtsp, StreamMethod::Rtsp.label());
-                                ui.selectable_value(&mut self.stream_method, StreamMethod::Snapshot, StreamMethod::Snapshot.label());
-                                ui.selectable_value(&mut self.stream_method, StreamMethod::PlayCtrl, StreamMethod::PlayCtrl.label());
-                                ui.selectable_value(&mut self.stream_method, StreamMethod::HCNetSDK, StreamMethod::HCNetSDK.label());
-                                ui.selectable_value(&mut self.stream_method, StreamMethod::HCNetSDK_X11, StreamMethod::HCNetSDK_X11.label());
+                                let s = self.i18n();
+                                ui.selectable_value(&mut self.stream_method, StreamMethod::Rtsp, s.method_rtsp());
+                                ui.selectable_value(&mut self.stream_method, StreamMethod::Snapshot, s.method_snapshot());
+                                ui.selectable_value(&mut self.stream_method, StreamMethod::PlayCtrl, s.method_playctrl());
+                                ui.selectable_value(&mut self.stream_method, StreamMethod::HCNetSDK, s.method_hcnetsdk());
+                                ui.selectable_value(&mut self.stream_method, StreamMethod::HCNetSDK_X11, s.method_hcnetsdk_x11());
                             });
                         ui.end_row();
+
+                        let s = self.i18n();
                         ui.label("");
-                        ui.checkbox(&mut self.use_substream, "Sub-stream (menor resolução, mais leve)");
+                        ui.checkbox(&mut self.use_substream, s.substream_checkbox());
                         ui.end_row();
                         if self.stream_method == StreamMethod::Snapshot {
-                            ui.label("Intervalo (ms):");
+                            ui.label(s.interval_label());
                             ui.add(egui::Slider::new(&mut self.snapshot_interval, 100u64..=2000).suffix("ms"));
                             ui.end_row();
                         }
                         if self.stream_method.needs_verification_code() {
-                            ui.label("Verification Code:");
+                            ui.label(s.verification_code_label());
                             ui.add_sized([field_w, field_h], egui::TextEdit::singleline(&mut self.verification_code).password(true));
                             ui.end_row();
                         }
                         if self.stream_method.needs_sdk_library() {
                             let hint = if self.stream_method == StreamMethod::HCNetSDK || self.stream_method == StreamMethod::HCNetSDK_X11 {
-                                "libhcnetsdk.so (vazio=auto)"
+                                s.library_path_hint()
                             } else {
-                                "Deixe vazio para buscar automático"
+                                s.library_path_auto_hint()
                             };
-                            ui.label("Library Path:");
+                            ui.label(s.library_path_label());
                             ui.add_sized([field_w, field_h], egui::TextEdit::singleline(&mut self.library_path).hint_text(hint));
                             ui.end_row();
                         }
                     });
 
                 ui.add_space(10.0);
-                if ui.button("Connect").clicked() {
-                    self.connect();
+
+                let s = self.i18n();
+                ui.horizontal(|ui| {
+                    if ui.button(s.connect_button()).clicked() {
+                        self.connect();
+                    }
+                    ui.add_space(20.0);
+                    ui.label(s.language_selector_label());
+                    for &(lang, _short, display) in Lang::variants() {
+                        ui.selectable_value(&mut self.lang, lang, display);
+                    }
+                });
+                if self.lang != s.lang {
+                    Config::from_app(self).save();
                 }
 
                 ui.add_space(10.0);
+
+                let s = self.i18n();
                 let status = match self.stream_method {
-                    StreamMethod::HCNetSDK => egui::RichText::new("🔐 HCNetSDK (callback + PlayM4). Descriptografia automática via NET_DVR_SetSDKSecretKey.").small().color(egui::Color32::DARK_GREEN),
-                    StreamMethod::HCNetSDK_X11 => egui::RichText::new("🖥️ HCNetSDK X11 (overlay direto). SDK renderiza via X11 — sem decodificação manual. Requer libhcnetsdk.so.").small().color(egui::Color32::DARK_GREEN),
-                    StreamMethod::PlayCtrl => egui::RichText::new("🔐 PlayCtrl com descriptografia. Requer libPlayCtrl.so e Verification Code do DVR.").small().color(egui::Color32::DARK_GREEN),
-                    StreamMethod::Snapshot => egui::RichText::new("ℹ️ Snapshot JPEG polling. ~2-3 FPS. Não requer desativar criptografia.").small().color(egui::Color32::DARK_GRAY),
-                    StreamMethod::Rtsp => egui::RichText::new("⚠️ RTSP direto. Se a 'Criptografia de Transmissão' estiver ativada no DVR, o vídeo não carregará.").small().color(egui::Color32::DARK_GRAY),
+                    StreamMethod::HCNetSDK => egui::RichText::new(s.status_hcnetsdk()).small().color(egui::Color32::DARK_GREEN),
+                    StreamMethod::HCNetSDK_X11 => egui::RichText::new(s.status_hcnetsdk_x11()).small().color(egui::Color32::DARK_GREEN),
+                    StreamMethod::PlayCtrl => egui::RichText::new(s.status_playctrl()).small().color(egui::Color32::DARK_GREEN),
+                    StreamMethod::Snapshot => egui::RichText::new(s.status_snapshot()).small().color(egui::Color32::DARK_GRAY),
+                    StreamMethod::Rtsp => egui::RichText::new(s.status_rtsp()).small().color(egui::Color32::DARK_GRAY),
                 };
                 ui.label(status);
 
@@ -1104,39 +1135,40 @@ impl HikvisionApp {
         });
 
         if let Some(ref new_fp) = self.pending_new_fingerprint.clone() {
+            let s = self.i18n();
             let is_first = self.cert_fingerprint.is_none();
-            let title = if is_first { "Confirmar certificado" } else { "Fingerprint alterado" };
+            let title = if is_first { s.cert_confirm_title() } else { s.cert_changed_title() };
             egui::Window::new(title)
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     if is_first {
-                        ui.label("Primeira conexão HTTPS com este servidor.");
-                        ui.label("Verifique o fingerprint do certificado:");
+                        ui.label(s.cert_first_connection());
+                        ui.label(s.cert_verify_fingerprint());
                     } else {
-                        ui.label("O certificado SSL do servidor mudou!");
-                        ui.label("Isso pode significar:");
-                        ui.label("  • O DVR foi reiniciado de fábrica");
-                        ui.label("  • O certificado foi regenerado");
+                        ui.label(s.cert_changed_msg());
+                        ui.label(s.cert_meanings_prompt());
+                        ui.label(s.cert_meanings_1());
+                        ui.label(s.cert_meanings_2());
                         ui.add_space(6.0);
                         if let Some(ref old_fp) = self.cert_fingerprint {
-                            ui.label(format!("Fingerprint antigo: {}", old_fp));
+                            ui.label(format!("{} {}", s.cert_old_fingerprint(), old_fp));
                         }
                     }
                     ui.add_space(4.0);
-                    ui.label(format!("Fingerprint: {}", new_fp));
+                    ui.label(format!("{} {}", s.cert_fingerprint_label(), new_fp));
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        if ui.button("✓ Aceitar (salvar fingerprint)").clicked() {
+                        if ui.button(s.cert_accept()).clicked() {
                             self.cert_fingerprint = Some(new_fp.clone());
                             self.pending_new_fingerprint = None;
                             self.error = None;
                             self.connect();
                         }
-                        if ui.button("✗ Rejeitar").clicked() {
+                        if ui.button(s.cert_reject()).clicked() {
                             self.pending_new_fingerprint = None;
-                            self.error = Some("Conexão rejeitada".into());
+                            self.error = Some(s.error_connection_rejected().into());
                         }
                     });
                 });
@@ -1144,6 +1176,7 @@ impl HikvisionApp {
     }
 
     fn show_viewer(&mut self, ctx: &egui::Context) {
+        let s = self.i18n();
         if self.layout_mode != self.prev_layout {
             self.prev_layout = self.layout_mode;
 
@@ -1213,10 +1246,10 @@ impl HikvisionApp {
                     ui.separator();
                     let active = self.streams.iter().filter(|s| s.stream_handle.is_some() || s.frame_rx.is_some()).count();
                     let total = self.channels.len();
-                    ui.label(format!("{}/{} streams", active, total));
+                    ui.label(s.streams_count(active, total));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Disconnect").clicked() {
+                    if ui.button(s.disconnect_button()).clicked() {
                         self.stop_all_streams();
                         self.api = None;
                         self.channels.clear();
@@ -1232,13 +1265,13 @@ impl HikvisionApp {
             .resizable(false)
             .default_width(200.0)
             .show(ctx, |ui| {
-                ui.heading("Channels");
+                ui.heading(s.channels_heading());
                 let method_label = match self.stream_method {
-                    StreamMethod::HCNetSDK => egui::RichText::new("🔐 HCNetSDK").small().color(egui::Color32::DARK_GREEN),
-                    StreamMethod::HCNetSDK_X11 => egui::RichText::new("🖥️ HCNetSDK X11").small().color(egui::Color32::DARK_GREEN),
-                    StreamMethod::PlayCtrl => egui::RichText::new("🔐 PlayCtrl").small().color(egui::Color32::DARK_GREEN),
-                    StreamMethod::Snapshot => egui::RichText::new("📷 Snapshot JPEG").small().color(egui::Color32::GREEN),
-                    StreamMethod::Rtsp => egui::RichText::new("🎥 RTSP direto").small().color(egui::Color32::LIGHT_BLUE),
+                    StreamMethod::HCNetSDK => egui::RichText::new(s.method_short_hcnetsdk()).small().color(egui::Color32::DARK_GREEN),
+                    StreamMethod::HCNetSDK_X11 => egui::RichText::new(s.method_short_hcnetsdk_x11()).small().color(egui::Color32::DARK_GREEN),
+                    StreamMethod::PlayCtrl => egui::RichText::new(s.method_short_playctrl()).small().color(egui::Color32::DARK_GREEN),
+                    StreamMethod::Snapshot => egui::RichText::new(s.method_short_snapshot()).small().color(egui::Color32::GREEN),
+                    StreamMethod::Rtsp => egui::RichText::new(s.method_short_rtsp()).small().color(egui::Color32::LIGHT_BLUE),
                 };
                 ui.label(method_label);
                 ui.separator();
@@ -1257,7 +1290,7 @@ impl HikvisionApp {
                 } else {
                     ui.colored_label(
                         egui::Color32::GRAY,
-                        "Sub-stream (auto em multi-view)",
+                        s.substream_info(),
                     );
                 }
 
@@ -1296,7 +1329,7 @@ impl HikvisionApp {
                                 }
                             }
                             ui.separator();
-                            if ui.button("Start All").clicked() {
+                            if ui.button(s.start_all()).clicked() {
                                 let cap = self.layout_mode.capacity();
                                 let empty_slots: Vec<usize> = (0..cap)
                                     .filter(|s| self.grid_slots.get(*s).map_or(true, |v| v.is_none()))
@@ -1312,7 +1345,7 @@ impl HikvisionApp {
                                     }
                                 }
                             }
-                            if ui.button("Stop All").clicked() {
+                            if ui.button(s.stop_all()).clicked() {
                                 for slot in 0..self.grid_slots.len() {
                                     if let Some(ch_idx) = self.grid_slots[slot].take() {
                                         self.stop_stream(ch_idx);
@@ -1325,11 +1358,7 @@ impl HikvisionApp {
 
                 if self.stream_method.is_x11_overlay() {
                     ui.separator();
-                    let label = if self.zero_channel_available > 0 {
-                        format!("Canal Zero ({})", self.zero_channel_available)
-                    } else {
-                        "Canal Zero".to_string()
-                    };
+                    let label = s.zero_channel_label(self.zero_channel_available);
                     if ui.checkbox(&mut self.zero_channel_active, &label).clicked() {
                         if self.zero_channel_active {
                             self.start_zero_channel(ctx);
@@ -1349,6 +1378,7 @@ impl HikvisionApp {
     }
 
     fn show_single_view(&mut self, ui: &mut egui::Ui) {
+        let s = self.i18n();
         // Modo X11 overlay: sincronizar janela filha e mostrar label
         if self.stream_method.is_x11_overlay() {
             let rect = ui.max_rect();
@@ -1363,7 +1393,7 @@ impl HikvisionApp {
                     mgr.ensure_window(ZC_SLOT, rect.min.x, rect.min.y, rect.width(), rect.height());
                 }
                 ui.vertical_centered(|ui| {
-                    ui.colored_label(egui::Color32::DARK_GREEN, "● Canal Zero — Mosaico multi-câmera (X11 overlay)");
+                    ui.colored_label(egui::Color32::DARK_GREEN, s.zero_channel_desc());
                 });
                 return;
             }
@@ -1373,7 +1403,7 @@ impl HikvisionApp {
                 _ => {
                     ui.vertical_centered(|ui| {
                         ui.add_space(100.0);
-                        ui.label("Select a channel to view");
+                        ui.label(s.select_channel());
                     });
                     return;
                 }
@@ -1388,11 +1418,11 @@ impl HikvisionApp {
             ui.vertical_centered(|ui| {
                 let name = &self.channels[idx].name;
                 if self.channel_is_active(idx) {
-                    ui.colored_label(egui::Color32::DARK_GREEN, format!("● {} — Live (X11 overlay)", name));
+                    ui.colored_label(egui::Color32::DARK_GREEN, s.live_label(name));
                 } else {
                     ui.add_space(100.0);
                     ui.label(name);
-                    ui.colored_label(egui::Color32::DARK_GRAY, "X11 overlay — aguardando stream");
+                    ui.colored_label(egui::Color32::DARK_GRAY, s.x11_waiting());
                 }
             });
             return;
@@ -1403,7 +1433,7 @@ impl HikvisionApp {
             _ => {
                 ui.vertical_centered(|ui| {
                     ui.add_space(100.0);
-                    ui.label("Select a channel to view");
+                    ui.label(s.select_channel());
                 });
                 return;
             }
@@ -1425,10 +1455,7 @@ impl HikvisionApp {
             let name = &self.channels[idx].name;
             let fps = self.streams[idx].fps;
             ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                ui.label(format!(
-                    "{} | {}x{} | {:.1} fps",
-                    name, state.frame_width, state.frame_height, fps
-                ));
+                ui.label(s.video_info(name, state.frame_width, state.frame_height, fps));
             });
         } else {
             ui.vertical_centered(|ui| {
@@ -1436,21 +1463,22 @@ impl HikvisionApp {
                 if self.channel_is_active(idx) {
                     ui.spinner();
                     let loading_label = match self.stream_method {
-                        StreamMethod::HCNetSDK => "HCNetSDK (callback mode)",
-                        StreamMethod::HCNetSDK_X11 => "HCNetSDK X11 (overlay mode)",
-                        StreamMethod::PlayCtrl => "PlayCtrl decrypting...",
-                        StreamMethod::Snapshot => "Polling snapshot...",
-                        StreamMethod::Rtsp => "Connecting to RTSP stream...",
+                        StreamMethod::HCNetSDK => s.loading_hcnetsdk(),
+                        StreamMethod::HCNetSDK_X11 => s.loading_hcnetsdk_x11(),
+                        StreamMethod::PlayCtrl => s.loading_playctrl(),
+                        StreamMethod::Snapshot => s.loading_snapshot(),
+                        StreamMethod::Rtsp => s.loading_rtsp(),
                     };
                     ui.label(loading_label);
                 } else {
-                    ui.label("Select a channel to view");
+                    ui.label(s.select_channel());
                 }
             });
         }
     }
 
     fn show_multi_view(&mut self, ui: &mut egui::Ui) {
+        let s = self.i18n();
         // Canal Zero ativo: substitui o grid multi-view pela janela do mosaico
         if self.zero_channel_active && self.stream_method.is_x11_overlay() {
             let rect = ui.max_rect();
@@ -1462,7 +1490,7 @@ impl HikvisionApp {
                 mgr.ensure_window(ZC_SLOT, rect.min.x, rect.min.y, rect.width(), rect.height());
             }
             ui.vertical_centered(|ui| {
-                ui.colored_label(egui::Color32::DARK_GREEN, "● Canal Zero — Mosaico multi-câmera (X11 overlay)");
+                ui.colored_label(egui::Color32::DARK_GREEN, s.zero_channel_desc());
             });
             return;
         }
@@ -1509,6 +1537,7 @@ impl HikvisionApp {
     }
 
     fn render_cell(&self, ui: &mut egui::Ui, _slot: usize, channel_idx: Option<usize>, cell_size: egui::Vec2) {
+        let s = self.i18n();
         // Dark background
         ui.painter().rect_filled(
             ui.max_rect(),
@@ -1520,7 +1549,7 @@ impl HikvisionApp {
             Some(ci) if ci < self.channels.len() => ci,
             _ => {
                 ui.add_space(cell_size.y * 0.4);
-                ui.colored_label(egui::Color32::DARK_GRAY, "No Signal");
+                ui.colored_label(egui::Color32::DARK_GRAY, s.no_signal());
                 return;
             }
         };
@@ -1534,9 +1563,9 @@ impl HikvisionApp {
             ui.add_space(cell_size.y * 0.35);
             ui.colored_label(egui::Color32::WHITE, &channel_name);
             if is_active {
-                ui.colored_label(egui::Color32::DARK_GREEN, "● Live");
+                ui.colored_label(egui::Color32::DARK_GREEN, s.live_text());
             } else {
-                ui.colored_label(egui::Color32::DARK_GRAY, "Sem Sinal");
+                ui.colored_label(egui::Color32::DARK_GRAY, s.no_signal());
             }
             return;
         }
@@ -1578,10 +1607,7 @@ impl HikvisionApp {
             ui.horizontal(|ui| {
                 ui.add_space(4.0);
                 ui.label(
-                    egui::RichText::new(format!(
-                        "{} {:.0}fps",
-                        channel_name, state.fps
-                    ))
+                    egui::RichText::new(s.fps_label(&channel_name, state.fps))
                     .size(12.0)
                     .color(egui::Color32::WHITE),
                 );
@@ -1590,9 +1616,9 @@ impl HikvisionApp {
             ui.add_space(cell_size.y * 0.35);
             ui.colored_label(egui::Color32::GRAY, &channel_name);
             if ch_idx < self.streams.len() && (self.streams[ch_idx].stream_handle.is_some() || self.streams[ch_idx].frame_rx.is_some()) {
-                ui.colored_label(egui::Color32::DARK_GRAY, "Aguardando...");
+                ui.colored_label(egui::Color32::DARK_GRAY, s.waiting_text());
             } else {
-                ui.colored_label(egui::Color32::DARK_GRAY, "Sem Sinal");
+                ui.colored_label(egui::Color32::DARK_GRAY, s.no_signal());
             }
         }
     }

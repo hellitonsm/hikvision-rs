@@ -1,15 +1,15 @@
-//! Teste do Canal Zero via HCNetSDK com janela X11.
+//! Canal Zero test via HCNetSDK with X11 window.
 //!
-//! Abre uma janela X11 e usa o modo overlay do SDK (realplay_with_window)
-//! para renderizar o vídeo do Canal Zero diretamente — sem PlayM4.
+//! Opens an X11 window and uses the SDK overlay mode (realplay_with_window)
+//! to render the Zero Channel video directly — no PlayM4.
 //!
-//! Tenta automaticamente múltiplos channel numbers candidatos baseados
-//! no device info. Se todos falharem, tenta com LINK_RTSP.
+//! Automatically tries multiple candidate channel numbers based
+//! on device info. If all fail, tries with LINK_RTSP.
 //!
-//! Uso:
+//! Usage:
 //!   zero_channel_hcnetsdk \
 //!     --host 192.168.1.100 \
-//!     --password senha \
+//!     --password <password> \
 //!     --verification-code ABC123 \
 //!     [--user admin] \
 //!     [--sdk-port 8000] \
@@ -39,22 +39,22 @@ struct Args {
 }
 
 fn print_usage() {
-    eprintln!("Teste do Canal Zero via HCNetSDK com janela X11");
+    eprintln!("Canal Zero test via HCNetSDK with X11 window");
     eprintln!();
-    eprintln!("Uso:");
-    eprintln!("  zero_channel_hcnetsdk --host <DVR_IP> --password <PASS> [opcoes]");
+    eprintln!("Usage:");
+    eprintln!("  zero_channel_hcnetsdk --host <DVR_IP> --password <PASS> [options]");
     eprintln!();
-    eprintln!("Obrigatorio:");
-    eprintln!("  --host              IP do DVR/NVR");
-    eprintln!("  --password          Senha de login do DVR");
-    eprintln!("  --verification-code Verification Code (para descriptografia)");
+    eprintln!("Required:");
+    eprintln!("  --host              DVR/NVR IP");
+    eprintln!("  --password          DVR login password");
+    eprintln!("  --verification-code DVR verification code");
     eprintln!();
-    eprintln!("Opcional:");
-    eprintln!("  --user              Usuario (default: admin)");
-    eprintln!("  --sdk-port          Porta SDK (default: 8000)");
-    eprintln!("  --library-path      Caminho customizado para libhcnetsdk.so");
-    eprintln!("  --zero-channel-number Canal zero manual (ex: 65)");
-    eprintln!("  --link-mode         0=TCP(default), 4=RTSP");
+    eprintln!("Options:");
+    eprintln!("  --user              Username (default: admin)");
+    eprintln!("  --sdk-port          SDK port (default: 8000)");
+    eprintln!("  --library-path      Custom path to libhcnetsdk.so");
+    eprintln!("  --zero-channel-number Manual zero channel number (ex: 65)");
+    eprintln!("  --link-mode         0=TCP (default), 4=RTSP");
 }
 
 fn parse_args() -> Option<Args> {
@@ -83,7 +83,7 @@ fn parse_args() -> Option<Args> {
             "--library-path" => { i += 1; library_path = args.get(i).cloned(); }
             "--zero-channel-number" => { i += 1; zero_channel_number = args.get(i).and_then(|s| s.parse().ok()); }
             "--link-mode" => { i += 1; link_mode = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(LINK_TCP); }
-            _ => { eprintln!("Argumento desconhecido: {}", args[i]); }
+            _ => { eprintln!("Unknown argument: {}", args[i]); }
         }
         i += 1;
     }

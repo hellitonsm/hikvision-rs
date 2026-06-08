@@ -1,4 +1,5 @@
 pub mod api;
+pub mod i18n;
 pub mod rtsp;
 pub mod snapshot_stream;
 pub mod encrypted_stream;
