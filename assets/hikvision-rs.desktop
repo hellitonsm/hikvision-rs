@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Hikvision RS
+GenericName=Visualizador RTSP
+Comment=Visualizador RTSP para DVRs Hikvision com interface gráfica nativa
+Exec=hikvision-rs
+Icon=hikvision-rs
+Terminal=false
+Categories=Network;Video;AudioVideo;
+Keywords=hikvision;rtsp;dvr;camera;surveillance;streaming;
+StartupNotify=true
