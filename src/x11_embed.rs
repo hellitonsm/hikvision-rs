@@ -192,15 +192,14 @@ impl EmbeddedX11Window {
         })
     }
 
-    /// Sincroniza posição e tamanho com o retângulo do egui.
-    ///
-    /// `abs_x`, `abs_y` são coordenadas absolutas na tela.
-    pub fn sync_rect(&mut self, abs_x: i32, abs_y: i32, width: u32, height: u32) {
+    /// Sincroniza posição e tamanho. Retorna `true` se a janela foi recém-mapeada
+    /// (estava invisível e agora ficou visível), ou se houve mudança de posição/tamanho.
+    pub fn sync_rect(&mut self, abs_x: i32, abs_y: i32, width: u32, height: u32) -> bool {
         if width == 0 || height == 0 {
             if self.visible {
                 self.hide();
             }
-            return;
+            return false;
         }
 
         let needs_move = abs_x != self.last_x || abs_y != self.last_y;
@@ -224,7 +223,7 @@ impl EmbeddedX11Window {
             self.last_y = abs_y;
             self.last_w = width;
             self.last_h = height;
-            return;
+            return true; // recém-mapeada
         }
 
         if needs_move || needs_resize {
@@ -241,7 +240,10 @@ impl EmbeddedX11Window {
             self.last_y = abs_y;
             self.last_w = width;
             self.last_h = height;
+            return true; // mudou posição/tamanho
         }
+
+        false // nada mudou
     }
 
     /// Move a janela para frente (XRaiseWindow) para ficar sobre o egui.
@@ -348,6 +350,10 @@ impl X11WindowManager {
 
         if let Some(wnd) = self.windows.get_mut(&idx) {
             wnd.sync_rect(abs_x, abs_y, w, h);
+            // raise() é necessário a cada frame porque o egui repinta por cima
+            // da janela overlay. Sem raise(), o overlay fica atrás (tela preta).
+            // O flickering era causado pelo hide_all() (unmap/map) no render loop,
+            // não pelo raise() (que só muda Z-order).
             wnd.raise();
         } else if let Some(wnd) = EmbeddedX11Window::new(abs_x, abs_y, w, h) {
             self.windows.insert(idx, wnd);

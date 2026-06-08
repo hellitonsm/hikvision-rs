@@ -1,4 +1,4 @@
-use hikvision_rs::api::{check_tls_fingerprint, Channel, FingerprintCheck, HikvisionAPI};
+use hikvision_rs::api::{check_tls_fingerprint, Channel, DeviceInfo, FingerprintCheck, HikvisionAPI};
 use hikvision_rs::hcnetsdk;
 use hikvision_rs::hcnetsdk_x11_multi;
 use hikvision_rs::playctrl_stream;
@@ -325,6 +325,13 @@ struct HikvisionApp {
     /// Mapeia slot do grid (0..capacity) -> índice em channels[].
     /// Ex: grid_slots[0] = Some(4) significa que a câmera channels[4] aparece no slot 0.
     grid_slots: Vec<Option<usize>>,
+
+    /// Número de canais zero suportados pelo DVR (lido do ISAPI após login).
+    zero_channel_available: u8,
+    /// Canal Zero está ativo no momento (toggle runtime).
+    zero_channel_active: bool,
+    /// Cópia do grid_slots antes de ativar o Canal Zero (para restaurar ao desativar).
+    saved_grid_slots: Vec<Option<usize>>,
 }
 
 impl Default for HikvisionApp {
@@ -359,6 +366,9 @@ impl Default for HikvisionApp {
             x11_window_xid_obtained: false,
             x11_pending: Vec::new(),
             grid_slots: Vec::new(),
+            zero_channel_available: 0,
+            zero_channel_active: false,
+            saved_grid_slots: Vec::new(),
         }
     }
 }
@@ -418,6 +428,7 @@ impl HikvisionApp {
             Ok(info) => {
                 self.device_name =
                     format!("{} | {} | {}", info.name, info.model, info.firmware);
+                self.zero_channel_available = info.zero_chan_num;
 
                 match api.channels() {
                     Ok(chs) => {
@@ -735,11 +746,13 @@ impl HikvisionApp {
             for slot in &mut self.grid_slots {
                 *slot = None;
             }
-            // Stop all SDK streams (logout via Drop)
+            // Stop all SDK streams (zero channel + individuais) (logout via Drop)
+            log::info!("hcnetsdk_x11_multi = None (stop_all_streams)");
             self.hcnetsdk_x11_multi = None;
             // Destroy all X11 overlay windows completely
             self.x11_manager = None;
             self.x11_pending.clear();
+            self.zero_channel_active = false;
             // Limpar stream states para que start_stream() não bloqueie
             for state in &mut self.streams {
                 state.stream_handle = None;
@@ -779,10 +792,31 @@ impl HikvisionApp {
     /// Tenta iniciar streams X11 pendentes cujas janelas já foram criadas.
     /// Chamado a cada frame após ensure_window() na renderização.
     fn try_start_pending_x11_streams(&mut self) {
-        if self.x11_pending.is_empty() {
+        if self.hcnetsdk_x11_multi.is_none() {
             return;
         }
-        if self.hcnetsdk_x11_multi.is_none() {
+
+        // --- CANAL ZERO PENDENTE ---
+        if self.zero_channel_active {
+            let win_id = self.x11_manager.as_ref().and_then(|mgr| mgr.window_id(999));
+            if let Some(win_id) = win_id {
+                let multi = self.hcnetsdk_x11_multi.as_mut().unwrap();
+                if !multi.zero_channel_active() {
+                    log::info!("Starting pending zero channel on window 0x{:x}", win_id);
+                    match multi.start_zero_channel(win_id) {
+                        Ok(()) => {
+                            log::info!("Zero channel started successfully on window 0x{:x}", win_id);
+                        }
+                        Err(e) => {
+                            log::error!("Failed to start zero channel: {}", e);
+                            self.zero_channel_active = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        if self.x11_pending.is_empty() {
             return;
         }
 
@@ -848,6 +882,84 @@ impl HikvisionApp {
             return false;
         }
         self.streams[idx].stream_handle.is_some() || self.streams[idx].frame_rx.is_some()
+    }
+
+    fn start_zero_channel(&mut self, _ctx: &egui::Context) {
+        log::info!("start_zero_channel entered");
+        if !self.stream_method.is_x11_overlay() {
+            return;
+        }
+
+        // Salvar grid_slots atual para restaurar ao desativar
+        self.saved_grid_slots = self.grid_slots.clone();
+
+        let to_stop: Vec<usize> = self.grid_slots.iter().filter_map(|s| *s).collect();
+        for slot in &mut self.grid_slots {
+            *slot = None;
+        }
+        for ch_idx in to_stop {
+            self.stop_stream(ch_idx);
+        }
+        self.x11_pending.clear();
+
+        // Esconder todas as janelas X11 restantes uma única vez.
+        // Isso substitui o hide_all() que estava no render loop a cada frame.
+        if let Some(ref mut mgr) = self.x11_manager {
+            mgr.hide_all();
+        }
+
+        if self.x11_main_xid.is_none() {
+            log::warn!("X11 main window not available, cannot start zero channel");
+            self.zero_channel_active = false;
+            return;
+        }
+
+        // Garantir que multi existe (login SDK)
+        if self.hcnetsdk_x11_multi.is_none() {
+            let vc = if self.verification_code.is_empty() {
+                None
+            } else {
+                Some(self.verification_code.as_str())
+            };
+            let host = self.host.trim();
+            let sdk_port: u16 = self.sdk_port.trim().parse().unwrap_or(8000);
+            match hcnetsdk_x11_multi::HCNetSDKX11Multi::new(
+                host, sdk_port, self.user.trim(), &self.password, vc,
+            ) {
+                Ok(multi) => {
+                    self.hcnetsdk_x11_multi = Some(multi);
+                }
+                Err(e) => {
+                    log::error!("Failed to create HCNetSDKX11Multi for zero channel: {}", e);
+                    self.zero_channel_active = false;
+                    return;
+                }
+            }
+        }
+
+        // Garantir que X11 manager existe
+        if self.x11_manager.is_none() {
+            self.x11_manager = Some(x11_embed::X11WindowManager::new());
+        }
+
+        // Sinaliza que o canal zero está ativo. O loop de renderização irá criar a janela
+        // com o tamanho correto, e depois try_start_pending_x11_streams iniciará o stream.
+        self.zero_channel_active = true;
+    }
+
+    fn stop_zero_channel(&mut self) {
+        log::info!("Stopping zero channel");
+        // Para o stream do Canal Zero no multi existente (sem fazer logout)
+        if let Some(ref mut multi) = self.hcnetsdk_x11_multi {
+            let _ = multi.stop_zero_channel();
+        }
+        // Remove a janela do Canal Zero do manager
+        if let Some(ref mut mgr) = self.x11_manager {
+            mgr.remove_window(999);
+        }
+        // Restaura os canais individuais que estavam ativos antes
+        self.grid_slots = std::mem::replace(&mut self.saved_grid_slots, Vec::new());
+        self.zero_channel_active = false;
     }
 
     fn drain_frames(&mut self, ctx: &egui::Context) {
@@ -1057,6 +1169,7 @@ impl HikvisionApp {
                 log::info!("Layout change: {} active channels to re-start", active_channels.len());
 
                 // Destruir tudo e reconstruir limpo
+                log::info!("hcnetsdk_x11_multi = None (layout change)");
                 self.hcnetsdk_x11_multi = None;
                 self.x11_manager = None;
                 self.x11_pending.clear();
@@ -1111,6 +1224,7 @@ impl HikvisionApp {
                         self.focused_channel = None;
                     }
                 });
+
             });
         });
 
@@ -1208,6 +1322,22 @@ impl HikvisionApp {
                         }
                     }
                 });
+
+                if self.stream_method.is_x11_overlay() {
+                    ui.separator();
+                    let label = if self.zero_channel_available > 0 {
+                        format!("Canal Zero ({})", self.zero_channel_available)
+                    } else {
+                        "Canal Zero".to_string()
+                    };
+                    if ui.checkbox(&mut self.zero_channel_active, &label).clicked() {
+                        if self.zero_channel_active {
+                            self.start_zero_channel(ctx);
+                        } else {
+                            self.stop_zero_channel();
+                        }
+                    }
+                }
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -1221,6 +1351,23 @@ impl HikvisionApp {
     fn show_single_view(&mut self, ui: &mut egui::Ui) {
         // Modo X11 overlay: sincronizar janela filha e mostrar label
         if self.stream_method.is_x11_overlay() {
+            let rect = ui.max_rect();
+
+            if self.zero_channel_active {
+                // Canal Zero ativo: janela dedicada ocupando toda área de visualização.
+                // NÃO chamar hide_all() aqui — os streams individuais já foram parados
+                // em start_zero_channel(). Chamar hide_all() a cada frame causa
+                // unmap/map repetido que faz a tela piscar.
+                if let Some(ref mut mgr) = self.x11_manager {
+                    const ZC_SLOT: usize = 999;
+                    mgr.ensure_window(ZC_SLOT, rect.min.x, rect.min.y, rect.width(), rect.height());
+                }
+                ui.vertical_centered(|ui| {
+                    ui.colored_label(egui::Color32::DARK_GREEN, "● Canal Zero — Mosaico multi-câmera (X11 overlay)");
+                });
+                return;
+            }
+
             let idx = match self.focused_channel {
                 Some(i) if i < self.channels.len() => i,
                 _ => {
@@ -1232,7 +1379,6 @@ impl HikvisionApp {
                 }
             };
 
-            let rect = ui.max_rect();
             if let Some(ref mut mgr) = self.x11_manager {
                 // No modo Single, esconder janelas de outros canais
                 mgr.hide_all_except(idx);
@@ -1305,6 +1451,22 @@ impl HikvisionApp {
     }
 
     fn show_multi_view(&mut self, ui: &mut egui::Ui) {
+        // Canal Zero ativo: substitui o grid multi-view pela janela do mosaico
+        if self.zero_channel_active && self.stream_method.is_x11_overlay() {
+            let rect = ui.max_rect();
+            // NÃO chamar hide_all() aqui — os streams individuais já foram parados
+            // em start_zero_channel(). Chamar hide_all() a cada frame causa
+            // unmap/map repetido que faz a tela piscar.
+            if let Some(ref mut mgr) = self.x11_manager {
+                const ZC_SLOT: usize = 999;
+                mgr.ensure_window(ZC_SLOT, rect.min.x, rect.min.y, rect.width(), rect.height());
+            }
+            ui.vertical_centered(|ui| {
+                ui.colored_label(egui::Color32::DARK_GREEN, "● Canal Zero — Mosaico multi-câmera (X11 overlay)");
+            });
+            return;
+        }
+
         let spacing = 2.0;
         let cols = self.layout_mode.cols() as f32;
         let rows = self.layout_mode.rows() as f32;
@@ -1477,15 +1639,20 @@ impl eframe::App for HikvisionApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        log::info!("on_exit called");
         self.stop_all_streams();
         self.x11_manager = None;
+        log::info!("hcnetsdk_x11_multi = None (on_exit)");
         self.hcnetsdk_x11_multi = None;
         self.x11_pending.clear();
+        self.zero_channel_active = false;
     }
 }
 
 fn main() {
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_millis()
+        .init();
 
     ffmpeg_next::init().expect("Failed to initialize FFmpeg");
     ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Warning);
