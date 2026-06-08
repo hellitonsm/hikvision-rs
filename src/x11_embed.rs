@@ -121,6 +121,7 @@ pub struct EmbeddedX11Window {
     /// Window ID (XID).
     window: u32,
     /// WM_DELETE_WINDOW atom (para detectar close).
+    #[allow(dead_code)]
     wm_delete: u32,
     /// Última posição e tamanho (absoluto na tela).
     last_x: i32,

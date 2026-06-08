@@ -1,4 +1,4 @@
-use hikvision_rs::api::{check_tls_fingerprint, Channel, DeviceInfo, FingerprintCheck, HikvisionAPI};
+use hikvision_rs::api::{check_tls_fingerprint, Channel, FingerprintCheck, HikvisionAPI};
 use hikvision_rs::hcnetsdk;
 use hikvision_rs::hcnetsdk_x11_multi;
 use hikvision_rs::i18n::{Lang, Strings};

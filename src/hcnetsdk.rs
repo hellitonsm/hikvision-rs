@@ -83,6 +83,7 @@ pub const NET_DVR_STREAMDATA: DWORD = 2;
 /// Layout matches HCNetSDK.h exactly (80 bytes on Linux x86_64).
 #[repr(C)]
 #[derive(Debug, Clone)]
+#[allow(non_snake_case)]
 pub struct NET_DVR_DEVICEINFO_V30 {
     pub sSerialNumber: [c_char; SERIALNO_LEN],  // 48
     pub byAlarmInPortNum: u8,                   // 1
@@ -120,6 +121,7 @@ pub struct NET_DVR_DEVICEINFO_V30 {
 /// Device info V40 (wrapper around V30 with extra fields, 344 bytes total)
 #[repr(C)]
 #[derive(Debug, Clone)]
+#[allow(non_snake_case)]
 pub struct NET_DVR_DEVICEINFO_V40 {
     pub struDeviceV30: NET_DVR_DEVICEINFO_V30, // 80 bytes
     pub bySupportLock: u8,                      // 1
@@ -145,6 +147,7 @@ pub struct NET_DVR_DEVICEINFO_V40 {
 /// Login information for NET_DVR_Login_V40
 /// Layout corresponde ao rustdemo (e ao HCNetSDK.h original)
 #[repr(C)]
+#[allow(non_snake_case)]
 pub struct NET_DVR_USER_LOGIN_INFO {
     pub sDeviceAddress: [c_char; NET_DVR_DEV_ADDRESS_MAX_LEN],
     pub byUseTransport: u8,
@@ -168,6 +171,7 @@ pub struct NET_DVR_USER_LOGIN_INFO {
 /// NET_DVR_DEV_CHAN_INFO_EX and other channel-config structs.
 /// Canal Zero is selected via lChannel with the virtual channel index.
 #[repr(C)]
+#[allow(non_snake_case)]
 pub struct NET_DVR_PREVIEWINFO {
     pub lChannel: LONG,
     pub dwStreamType: DWORD,
@@ -191,6 +195,7 @@ pub struct NET_DVR_PREVIEWINFO {
 /// bit 31 de lLinkMode: 0=main stream, 1=sub stream.
 /// bits 0-30 de lLinkMode: 0=TCP, 1=UDP, 2=Multicast, 3=RTP, 4=RTP/RTSP, 5=RSTP/HTTP
 #[repr(C)]
+#[allow(non_snake_case)]
 pub struct NET_DVR_CLIENTINFO {
     pub lChannel: LONG,
     pub lLinkMode: LONG,  // bit31=stream_type, bits0-30=link_mode
@@ -205,6 +210,7 @@ pub type REALDATACALLBACK = extern "C" fn(LONG, DWORD, *mut u8, DWORD, *mut c_vo
 
 /// Zero channel configuration (command 1102/1103)
 #[repr(C)]
+#[allow(non_snake_case)]
 pub struct NET_DVR_ZEROCHANCFG {
     pub dwSize: u32,
     pub byEnable: u8,        // 0=disabled, 1=enabled
@@ -223,6 +229,7 @@ pub const NET_DVR_SET_ZERO_PREVIEWCFG_V30: DWORD = 1105;
 /// bySwitchSeq[preview_mode][window] maps window position to channel number.
 /// 0xFF = window not used. MAX_PREVIEW_MODE=8, MAX_WINDOW_V30=32.
 #[repr(C)]
+#[allow(non_snake_case)]
 pub struct NET_DVR_PREVIEWCFG_V30 {
     pub dwSize: u32,
     pub byPreviewNumber: u8,    // 0=1w, 1=4w, 2=9w, 3=16w, 0xff=max
@@ -235,6 +242,7 @@ pub struct NET_DVR_PREVIEWCFG_V30 {
 /// Preview info for NET_DVR_RealPlaySpecial (custom RTSP URL preview).
 /// Allows passing an arbitrary RTSP URL directly to the SDK.
 #[repr(C)]
+#[allow(non_snake_case)]
 pub struct NET_DVR_PREVIEWINFO_SPECIAL {
     pub sURL: [c_char; 1024],
     pub dwLinkMode: DWORD,

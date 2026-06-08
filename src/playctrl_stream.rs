@@ -16,6 +16,7 @@ use crate::rtsp::RtspFrame;
 /// Used to decide fallback and retry strategy: whether to try the next channel ID,
 /// retry the same one with backoff, or abort entirely.
 #[derive(Debug)]
+#[allow(dead_code)]
 enum ZeroChannelError {
     /// Device does not have zero channel capability (404, 461, SDK error 953)
     NotSupported,
@@ -398,7 +399,7 @@ impl RtspSession {
     }
 }
 
-fn strip_rtp_header(data: &[u8]) -> &[u8] {
+fn _strip_rtp_header(data: &[u8]) -> &[u8] {
     if data.len() < 12 {
         return data;
     }

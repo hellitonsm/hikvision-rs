@@ -35,6 +35,7 @@ struct Args {
     verification_code: Option<String>,
     library_path: Option<String>,
     zero_channel_number: Option<i32>,
+    #[allow(dead_code)]
     link_mode: u32,
 }
 

@@ -209,8 +209,8 @@ fn decoder_loop(
 
     let mut syshead = Vec::new();
     let mut stream_opened = false;
-    let mut input_bytes = 0u64;
-    let mut h264_bytes = 0u64;
+    let mut _input_bytes = 0u64;
+    let mut _h264_bytes = 0u64;
 
     let mut frame_count = 0u64;
     let start = Instant::now();
@@ -256,8 +256,8 @@ fn decoder_loop(
                         }
                         continue;
                     };
-                    input_bytes += data.len() as u64;
-                    h264_bytes += h264.len() as u64;
+                    _input_bytes += data.len() as u64;
+                    _h264_bytes += h264.len() as u64;
                     if frame_count == 0 && !h264.is_empty() {
                         log::info!(
                             "[ch{}] first H.264 buffer: {} bytes, first_16={:02x?}",
