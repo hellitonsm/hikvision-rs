@@ -40,6 +40,20 @@ install:
 	@mkdir -p $(DESKTOP_DIR)
 	install -m 644 assets/hikvision-rs.desktop $(DESKTOP_DIR)/hikvision-rs.desktop
 	@echo "  Desktop: $(DESKTOP_DIR)/hikvision-rs.desktop"
+	@if [ -d "hikvision-libs" ]; then \
+		mkdir -p /usr/local/lib; \
+		for lib in $(BUILD_DIR)/hikvision-libs/*.so; do \
+			[ -f "$$lib" ] && install -m 644 "$$lib" /usr/local/lib/ && echo "  Lib:    /usr/local/lib/$$(basename $$lib)"; \
+		done; \
+	elif [ -d "$(HOME)/.config/hikvision-rs" ]; then \
+		mkdir -p /usr/local/lib; \
+		for lib in $(HOME)/.config/hikvision-rs/*.so; do \
+			[ -f "$$lib" ] && install -m 644 "$$lib" /usr/local/lib/ && echo "  Lib:    /usr/local/lib/$$(basename $$lib)"; \
+		done; \
+	else \
+		echo "  Libs:   Nenhuma lib encontrada em hikvision-libs/ ou ~/.config/hikvision-rs/"; \
+	fi
+	@ldconfig 2>/dev/null || true
 	@update-desktop-database $(DESKTOP_DIR) 2>/dev/null || true
 	@gtk-update-icon-cache -f /usr/share/icons/hicolor 2>/dev/null || true
 	@echo "Instalação concluída."
@@ -49,6 +63,10 @@ uninstall:
 	rm -f $(INSTALL_DIR)/$(BINARY_NAME)
 	rm -f $(ICON_DIR)/hikvision-rs.svg
 	rm -f $(DESKTOP_DIR)/hikvision-rs.desktop
+	@for lib in libhcnetsdk.so libPlayCtrl.so libAudioRender.so libSuperRender.so; do \
+		rm -f /usr/local/lib/$$lib; \
+	done
+	@ldconfig 2>/dev/null || true
 	@update-desktop-database $(DESKTOP_DIR) 2>/dev/null || true
 	@gtk-update-icon-cache -f /usr/share/icons/hicolor 2>/dev/null || true
 	@echo "Remoção concluída."

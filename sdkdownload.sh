@@ -22,7 +22,7 @@ if [ -z "$SDK_URL" ]; then
     echo "  $0 <URL_DO_SDK>"
     echo ""
     echo "Exemplo:"
-    echo "  $0 https://download.hikvision.com/xxxxx/Linux64_xxxxx.tgz"
+    echo "  $0 https://assets.hikvision.com/prd/normal/all/files/202605/EN-HCNetSDKV6.1.9.48_build20230410_linux64.zip"
     echo ""
     exit 1
 fi
@@ -40,6 +40,7 @@ rm sdk.tgz
 # Find and move libs to hikvision-libs root
 if [ -d "lib" ]; then
     cp lib/*.so . 2>/dev/null || true
+    cp lib/HCNetSDKCom/*.so . 2>/dev/null || true
 fi
 
 echo ""
@@ -48,10 +49,9 @@ echo " SDK instalado em: $LIBS_DIR"
 echo "=============================================="
 echo ""
 echo "Arquivos disponíveis:"
-ls -lh *.so 2>/dev/null || echo "  Nenhum .so encontrado"
+ls -lh *.so 2>/dev/null | awk '{print "  " $9}' || echo "  Nenhum .so encontrado"
 echo ""
-echo "Copie libPlayCtrl.so para o diretório de libs:"
-echo "  cp libPlayCtrl.so ~/.config/hikvision-rs/"
-echo ""
-echo "Ou mantenha em hikvision-libs/ junto ao binário."
+echo "Para instalar junto ao binário (make install):"
+echo "  cp *.so ~/.config/hikvision-rs/"
+echo "  sudo make install"
 echo ""
