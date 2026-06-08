@@ -96,45 +96,54 @@ Para usar os modos **PlayCtrl** ou **Canal Zero** com criptografia ativada, voc�
 
 #### Onde obter
 
-1. **Device Network SDK** (recomendado): Baixe o [SDK para Linux 64-bit](https://www.hikvision.com/en/support/download/sdk/) no site oficial da Hikvision
-2. **LocalComponent**: Se você já usa o plugin web Hikvision, a biblioteca pode estar em:
+1. **Script automático** (recomendado):
+   ```bash
+   ./sdkdownload.sh <URL_DO_SDK>
+   # O script baixa e extrai o SDK em hikvision-libs/
+   # Obtenha o link em: https://www.hikvision.com/en/support/download/sdk/
+   ```
+2. **Device Network SDK**: Baixe o [SDK para Linux 64-bit](https://www.hikvision.com/en/support/download/sdk/) no site oficial da Hikvision
+3. **LocalComponent**: Se você já usa o plugin web Hikvision, a biblioteca pode estar em:
    ```
    ~/.local/share/hikvision/weblocalserver/files/bin/libPlayCtrl.so
    ```
 
 #### Instalação das bibliotecas
 
-Copie `libPlayCtrl.so` para um dos caminhos de busca:
+Copie **todas** as bibliotecas do SDK para um dos caminhos de busca:
 
 ```bash
 # Opção 1: Diretório do projeto (junto ao binário)
-mkdir -p hikvision-libs
-cp libPlayCtrl.so hikvision-libs/
+# Copie todos os .so do SDK para hikvision-libs/
+cp lib*.so hikvision-libs/
+cp -r HCNetSDKCom hikvision-libs/
 
 # Opção 2: Diretório de configuração do usuário (RECOMENDADO)
 # Útil para não esquecer após reinstalar o aplicativo - as libs ficam
 # persistentes em ~/.config/hikvision-rs/
 mkdir -p ~/.config/hikvision-rs
-cp libPlayCtrl.so ~/.config/hikvision-rs/
+cp lib*.so ~/.config/hikvision-rs/
+cp -r HCNetSDKCom ~/.config/hikvision-rs/
 
 # Opção 3: Sistema (requer sudo)
-sudo cp libPlayCtrl.so /usr/local/lib/
+sudo cp lib*.so /usr/local/lib/
+sudo cp -r HCNetSDKCom /usr/local/lib/
 sudo ldconfig
 ```
 
-> **Importante**: Se você instalou o aplicativo via `make install` e pretende usar PlayCtrl ou Canal Zero com criptografia, **não esqueça de copiar as bibliotecas do SDK Hikvision** para um dos diretórios acima. Sem elas, o modo PlayCtrl/Canal Zero não funcionará.
+> **Importante**: São necessárias **várias** bibliotecas, não apenas `libPlayCtrl.so`. Você precisa copiar também `libAudioRender.so`, `libSuperRender.so`, `libHCCore.so`, `libhcnetsdk.so`, `libhpr.so`, `libNPQos.so`, `libz.so` e o diretório `HCNetSDKCom/` com seus componentes. O script `sdkdownload.sh` faz isso automaticamente.
 
 #### Verificação
 
-O aplicativo busca automaticamente a biblioteca nos seguintes locais (em ordem):
+O aplicativo busca automaticamente as bibliotecas nos seguintes locais (em ordem):
 
-1. `./hikvision-libs/libPlayCtrl.so`
-2. `~/.config/hikvision-rs/libPlayCtrl.so`
-3. `~/.local/share/hikvision/weblocalserver/files/bin/libPlayCtrl.so`
-4. `/usr/local/lib/libPlayCtrl.so`
-5. `/usr/lib/libPlayCtrl.so`
+1. `./hikvision-libs/` (todas as libs + HCNetSDKCom/)
+2. `~/.config/hikvision-rs/` (todas as libs + HCNetSDKCom/)
+3. `~/.local/share/hikvision/weblocalserver/files/bin/`
+4. `/usr/local/lib/`
+5. `/usr/lib/`
 
-Se não encontrar, você verá o erro: `libPlayCtrl.so not found in any search path.`
+Se não encontrar `libPlayCtrl.so`, você verá o erro: `libPlayCtrl.so not found in any search path.`
 
 ## Compilação e Instalação
 
@@ -146,12 +155,14 @@ make release
 # Instalar (requer sudo)
 sudo make install
 # Binário será instalado em: /usr/local/bin/hikvision-rs
+# Ícone e .desktop serão instalados automaticamente
+# Bibliotecas .so do SDK serão copiadas para /usr/local/lib/
 
 # Uninstall
 sudo make uninstall
 ```
 
-## Bibliotecas do SDK Hikvision (para streams criptografados)
+> **Nota**: Se você pretende usar PlayCtrl ou Canal Zero com criptografia, o `make install` tentará copiar automaticamente as bibliotecas do SDK de `hikvision-libs/` ou `~/.config/hikvision-rs/` para `/usr/local/lib/`.
 
 ## Uso
 
