@@ -40,23 +40,28 @@ install:
 	@mkdir -p $(DESKTOP_DIR)
 	install -m 644 assets/hikvision-rs.desktop $(DESKTOP_DIR)/hikvision-rs.desktop
 	@echo "  Desktop: $(DESKTOP_DIR)/hikvision-rs.desktop"
-	@if [ -d "hikvision-libs" ]; then \
-		mkdir -p /usr/local/lib; \
-		for lib in $(BUILD_DIR)/hikvision-libs/*.so; do \
-			[ -f "$$lib" ] && install -m 644 "$$lib" /usr/local/lib/ && echo "  Lib:    /usr/local/lib/$$(basename $$lib)"; \
+	@mkdir -p /usr/local/lib; \
+	if [ -d "hikvision-libs" ]; then \
+		for lib in hikvision-libs/*.so; do \
+			if [ -f "$$lib" ]; then \
+				install -m 644 "$$lib" /usr/local/lib/; \
+				echo "  Lib:    /usr/local/lib/$$(basename $$lib)"; \
+			fi; \
 		done; \
 	elif [ -d "$(HOME)/.config/hikvision-rs" ]; then \
-		mkdir -p /usr/local/lib; \
 		for lib in $(HOME)/.config/hikvision-rs/*.so; do \
-			[ -f "$$lib" ] && install -m 644 "$$lib" /usr/local/lib/ && echo "  Lib:    /usr/local/lib/$$(basename $$lib)"; \
+			if [ -f "$$lib" ]; then \
+				install -m 644 "$$lib" /usr/local/lib/; \
+				echo "  Lib:    /usr/local/lib/$$(basename $$lib)"; \
+			fi; \
 		done; \
 	else \
 		echo "  Libs:   Nenhuma lib encontrada em hikvision-libs/ ou ~/.config/hikvision-rs/"; \
 	fi
-	@ldconfig 2>/dev/null || true
-	@update-desktop-database $(DESKTOP_DIR) 2>/dev/null || true
-	@gtk-update-icon-cache -f /usr/share/icons/hicolor 2>/dev/null || true
-	@echo "Instalação concluída."
+	@ldconfig 2>/dev/null; \
+	update-desktop-database $(DESKTOP_DIR) 2>/dev/null; \
+	gtk-update-icon-cache -f /usr/share/icons/hicolor 2>/dev/null || true; \
+	echo "Instalação concluída."
 
 uninstall:
 	@echo "Removendo $(BINARY_NAME)..."
