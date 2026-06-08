@@ -52,11 +52,17 @@ impl Strings {
     }
 
     pub fn http_port_label(&self) -> &'static str {
-        "HTTP Port:"
+        match self.lang {
+            Lang::En => "HTTP Port:",
+            Lang::Pt => "Porta HTTP:",
+        }
     }
 
     pub fn https_port_label(&self) -> &'static str {
-        "HTTPS Port:"
+        match self.lang {
+            Lang::En => "HTTPS Port:",
+            Lang::Pt => "Porta HTTPS:",
+        }
     }
 
     pub fn https_label(&self) -> &'static str {
@@ -71,19 +77,31 @@ impl Strings {
     }
 
     pub fn rtsp_port_label(&self) -> &'static str {
-        "RTSP Port:"
+        match self.lang {
+            Lang::En => "RTSP Port:",
+            Lang::Pt => "Porta RTSP:",
+        }
     }
 
     pub fn sdk_port_label(&self) -> &'static str {
-        "SDK Port:"
+        match self.lang {
+            Lang::En => "SDK Port:",
+            Lang::Pt => "Porta SDK:",
+        }
     }
 
     pub fn username_label(&self) -> &'static str {
-        "Username:"
+        match self.lang {
+            Lang::En => "Username:",
+            Lang::Pt => "Usuário:",
+        }
     }
 
     pub fn password_label(&self) -> &'static str {
-        "Password:"
+        match self.lang {
+            Lang::En => "Password:",
+            Lang::Pt => "Senha:",
+        }
     }
 
     pub fn method_label(&self) -> &'static str {
@@ -108,11 +126,17 @@ impl Strings {
     }
 
     pub fn verification_code_label(&self) -> &'static str {
-        "Verification Code:"
+        match self.lang {
+            Lang::En => "Verification Code:",
+            Lang::Pt => "Código de Verificação:",
+        }
     }
 
     pub fn library_path_label(&self) -> &'static str {
-        "Library Path:"
+        match self.lang {
+            Lang::En => "Library Path:",
+            Lang::Pt => "Caminho da Biblioteca:",
+        }
     }
 
     pub fn library_path_hint(&self) -> &'static str {
@@ -130,7 +154,10 @@ impl Strings {
     }
 
     pub fn connect_button(&self) -> &'static str {
-        "Connect"
+        match self.lang {
+            Lang::En => "Connect",
+            Lang::Pt => "Conectar",
+        }
     }
 
     pub fn language_selector_label(&self) -> &'static str {
@@ -245,7 +272,10 @@ impl Strings {
     // ── Viewer Screen ──────────────────────────────────────────────────────
 
     pub fn disconnect_button(&self) -> &'static str {
-        "Disconnect"
+        match self.lang {
+            Lang::En => "Disconnect",
+            Lang::Pt => "Desconectar",
+        }
     }
 
     pub fn channels_heading(&self) -> &'static str {
