@@ -1012,8 +1012,20 @@ impl HikvisionApp {
     fn show_login(&mut self, ctx: &egui::Context) {
         let s = self.i18n();
         egui::CentralPanel::default().show(ctx, |ui| {
+            let prev_lang = self.lang;
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                ui.add_space(4.0);
+                for &(lang, _short, display) in Lang::variants() {
+                    ui.selectable_value(&mut self.lang, lang, display);
+                }
+                ui.label(s.language_selector_label());
+            });
+            if self.lang != prev_lang {
+                Config::from_app(self).save();
+            }
+
             ui.vertical_centered(|ui| {
-                ui.add_space(100.0);
+                ui.add_space(80.0);
                 ui.heading(s.heading());
                 ui.label(s.subtitle());
                 ui.add_space(20.0);
@@ -1102,18 +1114,8 @@ impl HikvisionApp {
                 ui.add_space(10.0);
 
                 let s = self.i18n();
-                ui.horizontal(|ui| {
-                    if ui.button(s.connect_button()).clicked() {
-                        self.connect();
-                    }
-                    ui.add_space(20.0);
-                    ui.label(s.language_selector_label());
-                    for &(lang, _short, display) in Lang::variants() {
-                        ui.selectable_value(&mut self.lang, lang, display);
-                    }
-                });
-                if self.lang != s.lang {
-                    Config::from_app(self).save();
+                if ui.button(s.connect_button()).clicked() {
+                    self.connect();
                 }
 
                 ui.add_space(10.0);
